@@ -1337,6 +1337,29 @@ impl ExecutionClient for KalshiExecutionClient {
         &self,
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
+        let result = self.collect_mass_status(lookback_mins).await;
+
+        // The node reports only that mass status failed, so the reason is logged here
+        if let Err(e) = &result {
+            log::error!("Kalshi mass status failed: {e:#}");
+        }
+
+        result
+    }
+}
+
+impl KalshiExecutionClient {
+    /// Returns whether mass status reports records of this market.
+    fn in_mass_status_scope(&self, ticker: &str) -> bool {
+        !self.config.mass_status_cached_instruments_only
+            || parse_instrument_id(ticker)
+                .is_ok_and(|id| self.core.cache().instrument(&id).is_some())
+    }
+
+    async fn collect_mass_status(
+        &self,
+        lookback_mins: Option<u64>,
+    ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let requested_at = self.clock.get_time_ns();
         let start = lookback_mins
             .map(DurationNanos::try_from_mins)
@@ -1353,8 +1376,14 @@ impl ExecutionClient for KalshiExecutionClient {
         .await?;
         let mut orders = Vec::new();
         let mut omitted = 0;
+        let mut unscoped = 0;
 
         for value in &snapshot.orders {
+            if !self.in_mass_status_scope(&value.ticker) {
+                unscoped += 1;
+                continue;
+            }
+
             anyhow::ensure!(
                 timestamp(&value.last_update_time)? <= snapshot.ts_init,
                 "order changed after mass collection began"
@@ -1377,6 +1406,11 @@ impl ExecutionClient for KalshiExecutionClient {
         let mut fills = Vec::new();
 
         for value in &snapshot.fills {
+            if !self.in_mass_status_scope(&value.ticker) {
+                unscoped += 1;
+                continue;
+            }
+
             let source = source_orders
                 .get(value.order_id.as_str())
                 .context("fill lacks order evidence")?;
@@ -1385,7 +1419,10 @@ impl ExecutionClient for KalshiExecutionClient {
         }
 
         validate_fill_coverage(
-            snapshot.orders.iter(),
+            snapshot
+                .orders
+                .iter()
+                .filter(|order| self.in_mass_status_scope(&order.ticker)),
             &fills,
             start,
             Some(snapshot.ts_init),
@@ -1394,6 +1431,11 @@ impl ExecutionClient for KalshiExecutionClient {
         let mut positions = Vec::new();
 
         for value in &snapshot.positions {
+            if !self.in_mass_status_scope(&value.ticker) {
+                unscoped += 1;
+                continue;
+            }
+
             let definition = self.definition(&value.ticker, snapshot.ts_init).await?;
             let report =
                 reports::position(value, &definition, self.core.account_id, snapshot.ts_init)?;
@@ -1420,7 +1462,13 @@ impl ExecutionClient for KalshiExecutionClient {
             );
         }
 
-        mass.set_report_window(start, omitted == 0);
+        if unscoped > 0 {
+            log::warn!(
+                "Kalshi mass status omits {unscoped} record(s) of markets without a cached instrument, reports are incomplete"
+            );
+        }
+
+        mass.set_report_window(start, omitted == 0 && unscoped == 0);
         mass.add_order_reports(orders);
         mass.add_fill_reports(fills);
         mass.add_position_reports(positions);

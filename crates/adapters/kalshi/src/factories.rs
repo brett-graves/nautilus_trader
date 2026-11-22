@@ -282,6 +282,7 @@ mod tests {
             recovery_debounce_ms: 0,
             direct_order_events: false,
             direct_audit_timeout_secs: 30,
+            mass_status_cached_instruments_only: false,
         }
     }
 

@@ -1150,6 +1150,14 @@ Verify the first fills of a session against the venue before relying on it.
   Nonzero fills, associated fills, or incomplete history fail the aggregate request.
 - **Report completeness**: Bulk reports warn about omissions, and mass status sets
   `reports_complete=false` while preserving independent cash holds.
+- **Mass status scope**: Mass status covers every order, fill, and position of the subaccount and
+  shard, so history in a market this node does not trade can fail startup. With
+  `mass_status_cached_instruments_only=true` it leaves out records of markets without a cached
+  instrument, warns with their count, and sets `reports_complete=false`. Private recovery is not
+  scoped: cash belongs to the whole subaccount, so an open position or a fill inside the recovery
+  window in another market still needs a definition the client admits.
+- **Mass status failures**: The adapter logs `Kalshi mass status failed` with the reason. The node
+  reports only that mass status failed.
 - **Omission cost**: Each omission requires a live fill lookup and a full ticker-scoped archived
   fill scan, including history before the requested report window.
 - **Deduplication**: Stable fill IDs deduplicate REST, stream, query, and explicit reconnect evidence.
@@ -1358,6 +1366,8 @@ The execution client also accepts:
   them. See [Direct order events](#direct-order-events).
 - `direct_audit_timeout_secs` (default `30`): Seconds for which recovery may fail to verify direct
   order events before submissions stop.
+- `mass_status_cached_instruments_only` (default `False`): Limit mass status to markets whose
+  instrument is cached. See [Order and fill reports](#order-and-fill-reports).
 
 ### Shared validation
 

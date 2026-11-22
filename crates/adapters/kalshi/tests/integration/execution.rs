@@ -661,6 +661,85 @@ async fn mass_report_keeps_one_window_and_rejects_missing_context(#[case] known:
     .unwrap();
 }
 
+#[rstest]
+#[case::every_market(false)]
+#[case::cached_markets(true)]
+#[tokio::test]
+async fn mass_report_scope_decides_whether_other_market_history_fails_it(#[case] scoped: bool) {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let mut f = report_fixtures();
+        f["fills"] = f["empty_fills"].clone();
+
+        // A filled order and a position in a market this client neither cached nor created
+        let mut other_order = f["orders"]["orders"][0].clone();
+        other_order["order_id"] = "order-other".into();
+        other_order["client_order_id"] = "".into();
+        other_order["ticker"] = "OTHER-MARKET".into();
+        f["orders"]["orders"]
+            .as_array_mut()
+            .unwrap()
+            .push(other_order);
+        let mut other_position = f["positions"]["market_positions"][0].clone();
+        other_position["ticker"] = "OTHER-MARKET".into();
+        f["positions"]["market_positions"]
+            .as_array_mut()
+            .unwrap()
+            .push(other_position);
+
+        let replies = snapshot_replies(&f);
+        let (listener, address) = http::bind_peer(0).await;
+        let peer = tokio::spawn(async move {
+            rest::quota_discovery(&listener).await;
+            for body in replies {
+                rest::reply(&listener, 200, body).await;
+            }
+        });
+
+        let (default_client, instrument, cache) = report_client(address, true, true);
+        drop(default_client);
+
+        let config = KalshiExecutionClientConfig {
+            api_key_id: Some("auth-test-id".into()),
+            private_key: Some(keys::ed25519_pkcs8().into()),
+            base_url_http: Some(format!("http://{address}/custom/v3").into()),
+            http_timeout_secs: 1,
+            exchange_index: 3,
+            mass_status_cached_instruments_only: scoped,
+            ..Default::default()
+        };
+
+        let core = ExecutionClientCore::new(
+            "TRADER-001".into(),
+            "TEST".into(),
+            *KALSHI_VENUE,
+            OmsType::Netting,
+            config.account_id,
+            AccountType::Cash,
+            Some(Currency::USD()),
+            Rc::clone(&cache),
+        );
+        let client = KalshiExecutionClient::new(core, config).unwrap();
+        let result = client.generate_mass_status(Some(60)).await;
+        peer.await.unwrap();
+
+        if scoped {
+            let mass = result.unwrap().unwrap();
+            assert!(!mass.reports_complete());
+            assert_eq!(mass.order_reports().len(), 1);
+            assert_eq!(mass.fill_reports().len(), 0);
+            assert_eq!(mass.position_reports().len(), 1);
+            assert_eq!(
+                mass.position_reports()[&instrument.id][0].signed_decimal_qty,
+                "-2.75".parse::<rust_decimal::Decimal>().unwrap()
+            );
+        } else {
+            assert!(result.is_err());
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn unbounded_mass_report_cannot_claim_complete_external_recovery() {
     tokio::time::timeout(Duration::from_secs(5), async {

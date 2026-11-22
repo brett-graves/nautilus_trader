@@ -267,6 +267,10 @@ pub struct KalshiExecutionClientConfig {
     /// before submissions stop.
     #[builder(default = 30)]
     pub direct_audit_timeout_secs: u64,
+    /// Limits mass status to markets whose instrument is cached and reports it incomplete when
+    /// records of other markets were left out.
+    #[builder(default)]
+    pub mass_status_cached_instruments_only: bool,
 }
 
 #[cfg(feature = "python")]
@@ -283,6 +287,7 @@ nautilus_core::impl_pyo3_config_getters!(KalshiExecutionClientConfig {
     recovery_debounce_ms: u64,
     direct_order_events: bool,
     direct_audit_timeout_secs: u64,
+    mass_status_cached_instruments_only: bool,
 });
 
 impl Default for KalshiExecutionClientConfig {
@@ -644,6 +649,7 @@ mod tests {
                 recovery_debounce_ms: 0,
                 direct_order_events: false,
                 direct_audit_timeout_secs: 30,
+                mass_status_cached_instruments_only: false,
             }
         );
         assert!(!data.has_credentials());
@@ -749,6 +755,7 @@ mod tests {
             .recovery_debounce_ms(150)
             .direct_order_events(true)
             .direct_audit_timeout_secs(45)
+            .mass_status_cached_instruments_only(true)
             .transport_backend(TransportBackend::Sockudo)
             .build();
         let round_trip_data: KalshiDataClientConfig =
