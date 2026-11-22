@@ -748,8 +748,19 @@ impl PrivateStream {
         for ticker in needed {
             let id = crate::common::parse::parse_instrument_id(&ticker)?;
             if !self.definitions.contains_key(&id) {
-                let definition = load_definition(&self.http, &ticker, snapshot.ts_init).await?;
-                super::validate_definition(&definition, self.config.exchange_index)?;
+                let definition = load_definition(
+                    &self.http,
+                    &ticker,
+                    self.config.admission(),
+                    snapshot.ts_init,
+                )
+                .await?;
+                super::validate_definition(
+                    &definition,
+                    self.config.exchange_index,
+                    self.config.admission(),
+                )?;
+
                 if let Some(sender) = &self.data_sender {
                     let data = InstrumentAny::BinaryOption(definition.clone()).into();
                     sender
@@ -762,7 +773,11 @@ impl PrivateStream {
         }
 
         for definition in self.definitions.values() {
-            super::validate_definition(definition, self.config.exchange_index)?;
+            super::validate_definition(
+                definition,
+                self.config.exchange_index,
+                self.config.admission(),
+            )?;
         }
 
         Ok(())
@@ -1229,6 +1244,169 @@ mod tests {
             ),
             (None, None) => assert_eq!(result.unwrap(), Decimal::new(6277, 4)),
         }
+    }
+
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    #[tokio::test]
+    async fn reservation_rejects_event_collateral_type_changed_after_admission() {
+        use crate::http::{
+            models::{Event, Market},
+            parse::parse_instrument,
+        };
+
+        let definitions: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_data/instruments.json")).unwrap();
+        let market: Market =
+            serde_json::from_value(definitions["definitions"]["live"]["market"].clone()).unwrap();
+        let event: Event =
+            serde_json::from_value(definitions["definitions"]["live"]["event"].clone()).unwrap();
+        let instrument = parse_instrument(&market, &event, UnixNanos::from(1)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let transport = KalshiDataClientConfig {
+            base_url_http: Some(format!("http://{}", listener.local_addr().unwrap()).into()),
+            ..Default::default()
+        };
+
+        let mut response_event = definitions["definitions"]["live"]["event"].clone();
+        response_event["collateral_return_type"] = "MECNET".into();
+
+        let server = serve_recovery(listener, Arc::new(Mutex::new(Vec::new())), move |target| {
+            assert!(target.starts_with("/events/"));
+            (
+                200,
+                serde_json::json!({"event": response_event, "markets": []}),
+            )
+        });
+
+        let server = tokio::spawn(server); // tokio-import-ok
+        let mut private = stream(&transport);
+        let id = instrument.id;
+        private.definitions.insert(id, instrument);
+        let result = private
+            .hold(id, OrderSide::Sell, Decimal::ONE, Decimal::new(6001, 4))
+            .await;
+        server.abort();
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "event collateral-return type changed after the definition was admitted"
+        );
+    }
+
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    #[rstest]
+    #[case::disabled("-2.75", Some(false), Some((0, false)), None)]
+    #[case::first_order("", None, Some((0, false)), None)]
+    #[case::flat_disabled("0.00", Some(false), Some((0, false)), None)]
+    #[case::flat_netted("0.00", Some(true), Some((0, false)), Some("applies to the subaccount's positions in this event"))]
+    #[case::setting_enabled("", None, Some((0, true)), Some("enabled or unconfirmed for the subaccount"))]
+    #[case::setting_missing("", None, None, Some("enabled or unconfirmed for the subaccount"))]
+    #[case::setting_other_shard("", None, Some((1, false)), Some("enabled or unconfirmed for the subaccount"))]
+    #[case::position_netted("-2.75", Some(true), Some((0, false)), Some("applies to the subaccount's positions in this event"))]
+    #[case::position_unproven("-2.75", None, Some((0, false)), Some("applies to the subaccount's positions in this event"))]
+    #[tokio::test]
+    async fn netting_event_order_requires_venue_evidence_of_disabled_netting(
+        #[case] position: &'static str,
+        #[case] position_netting: Option<bool>,
+        #[case] setting: Option<(u32, bool)>,
+        #[case] error: Option<&str>,
+    ) {
+        use crate::http::{
+            models::{Event, Market},
+            parse::{MarketAdmission, parse_instrument_admitting},
+            query::AccountQuery,
+        };
+
+        let definitions: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_data/instruments.json")).unwrap();
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_data/rest_responses.json")).unwrap();
+        let market: Market =
+            serde_json::from_value(definitions["definitions"]["unsupported"]["market"].clone())
+                .unwrap();
+        let event: Event =
+            serde_json::from_value(definitions["definitions"]["unsupported"]["event"].clone())
+                .unwrap();
+        let instrument = parse_instrument_admitting(
+            &market,
+            &event,
+            MarketAdmission {
+                collateral_netting: true,
+            },
+            UnixNanos::from(1),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let transport = KalshiDataClientConfig {
+            api_key_id: Some("netting-test".into()),
+            private_key: Some(keys::rsa_pkcs8().into()),
+            base_url_http: Some(format!("http://{}", listener.local_addr().unwrap()).into()),
+            ..Default::default()
+        };
+
+        let mut positions = fixtures["empty_positions"].clone();
+        if !position.is_empty() {
+            let mut row = fixtures["positions"]["market_positions"][0].clone();
+            row["ticker"] = market.ticker.clone().into();
+            row["exchange_index"] = 0.into();
+            row["position_fp"] = position.into();
+            if let Some(enabled) = position_netting {
+                row["netting_enabled"] = enabled.into();
+            }
+            positions["market_positions"] = serde_json::json!([row]);
+        }
+
+        let configs: Vec<_> = setting
+            .into_iter()
+            .map(|(shard, enabled)| {
+                serde_json::json!({"subaccount_number": 0, "enabled": enabled, "exchange_index": shard})
+            })
+            .chain([serde_json::json!({"subaccount_number": 7, "enabled": false, "exchange_index": 0})])
+            .collect();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+
+        let server = serve_recovery(listener, Arc::clone(&requests), move |target| {
+            let body = if target.starts_with("/account/limits") {
+                fixtures["limits"].clone()
+            } else if target.starts_with("/account/endpoint_costs") {
+                fixtures["costs"].clone()
+            } else if target.starts_with("/portfolio/positions?") {
+                positions.clone()
+            } else if target == "/portfolio/subaccounts/netting" {
+                serde_json::json!({"netting_configs": configs})
+            } else {
+                panic!("unexpected request {target}")
+            };
+
+            (200, body)
+        });
+
+        let server = tokio::spawn(server); // tokio-import-ok
+        let http = KalshiHttpClient::new_authenticated(&transport).unwrap();
+
+        let result = super::super::account::check_netting_disabled(
+            &http,
+            &instrument,
+            &AccountQuery {
+                subaccount: 0,
+                exchange_index: 0,
+            },
+        )
+        .await;
+        server.abort();
+
+        match error {
+            None => result.unwrap(),
+            Some(text) => assert!(result.unwrap_err().to_string().ends_with(text)),
+        }
+
+        assert!(requests.lock().unwrap().contains(
+            &"/portfolio/positions?limit=1000&event_ticker=KXESOCCERGAME-26OCT170222MORDSTRU&subaccount=0&exchange_index=0"
+                .to_string()
+        ));
     }
 
     #[cfg(not(all(feature = "simulation", madsim)))]

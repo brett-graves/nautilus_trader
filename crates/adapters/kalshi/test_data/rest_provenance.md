@@ -44,3 +44,9 @@ The request, error, and endpoint-cost field contracts are checked against the of
 retrieved on 5 November 2026: version `3.36.0`, SHA-256
 `94a3577612d78883c19fa33a3173e70b79c0f3cd765529d4ce3276bce7e5b884`.
 `quota_batch` deliberately omits order fields because its test exercises dispatch admission only.
+
+The `subaccount_netting` response is an original synthetic input which follows the
+`GetSubaccountNettingResponse` contract of the official REST schema version `3.37.0`, read on
+21 November 2026. Tests add the `netting_enabled` position field documented by the same schema to
+synthetic positions. Neither is a venue capture, and they do not establish which subaccount and shard
+entries a real account reports.

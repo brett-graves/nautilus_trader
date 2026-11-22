@@ -68,6 +68,7 @@ fn exact_response_fixtures_roundtrip_every_mapped_field() {
     roundtrip::<HistoricalCutoff>("cutoff");
     roundtrip::<Balance>("balance");
     roundtrip::<PositionsResponse>("positions");
+    roundtrip::<SubaccountNettingResponse>("subaccount_netting");
     roundtrip::<SettlementsResponse>("settlements");
     roundtrip::<FillsResponse>("fills");
     roundtrip::<OrdersResponse>("orders");
@@ -226,6 +227,13 @@ fn field_presence_and_unknown_order_status_are_preserved() {
     "/portfolio/positions?limit=2&settlement_status=all&subaccount=0&exchange_index=3",
     true,
     "positions"
+)]
+#[case(
+    "subaccount_netting",
+    "GET",
+    "/portfolio/subaccounts/netting",
+    true,
+    "subaccount_netting"
 )]
 #[case(
     "historical_positions",
@@ -563,6 +571,7 @@ async fn call(
             limit: Some(2),
             ..Default::default()
         })),
+        "subaccount_netting" => value!(client.get_subaccount_netting()),
         "limits" => value!(client.get_account_limits()),
         "costs" => value!(client.get_endpoint_costs()),
         "create" => value!(client.create_order(&create)),

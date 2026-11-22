@@ -234,10 +234,15 @@ impl KalshiExecutionClient {
 
             instrument
         } else {
-            load_definition(&self.http, ticker, ts_init).await?
+            load_definition(&self.http, ticker, self.config.admission(), ts_init).await?
         };
 
-        validate_definition(&instrument, self.config.exchange_index)?;
+        validate_definition(
+            &instrument,
+            self.config.exchange_index,
+            self.config.admission(),
+        )?;
+
         if unloaded && let Some(sender) = try_get_data_event_sender() {
             let data = InstrumentAny::BinaryOption(instrument.clone()).into();
             sender
@@ -1630,7 +1635,11 @@ impl KalshiExecutionClient {
             _ => anyhow::bail!("Kalshi submission requires a cached binary instrument"),
         };
 
-        validate_definition(&definition, self.config.exchange_index)?;
+        validate_definition(
+            &definition,
+            self.config.exchange_index,
+            self.config.admission(),
+        )?;
         let ws_client = self
             .ws_client
             .clone()
@@ -1845,7 +1854,11 @@ impl KalshiExecutionClient {
             _ => anyhow::bail!("Kalshi change requires a cached binary instrument"),
         };
 
-        validate_definition(&definition, self.config.exchange_index)?;
+        validate_definition(
+            &definition,
+            self.config.exchange_index,
+            self.config.admission(),
+        )?;
         let ws_client = self
             .ws_client
             .clone()

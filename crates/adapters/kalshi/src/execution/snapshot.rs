@@ -28,12 +28,12 @@ use nautilus_core::{
 use nautilus_model::{identifiers::InstrumentId, instruments::BinaryOption, orders::OrderAny};
 
 use crate::{
-    common::enums::{OrderStatusFilter, PositionSettlementStatus},
+    common::enums::{CollateralReturnType, OrderStatusFilter, PositionSettlementStatus},
     http::{
         client::KalshiHttpClient,
         error::KalshiHttpError,
         models::{Field, Fill, HistoricalCutoff, MarketPosition, Order, OrderStatus},
-        parse::Pagination,
+        parse::{MarketAdmission, MarketRefusal, MarketRefusalReason, Pagination},
         query::{
             AccountQuery, FillsQuery, HistoricalPositionsQuery, HistoryQuery, OrdersQuery,
             PositionsQuery,
@@ -840,6 +840,7 @@ pub(super) fn timestamp(value: &Field<jiff::Timestamp>) -> Result<UnixNanos, Kal
 pub(super) async fn load_definition(
     http: &KalshiHttpClient,
     ticker: &str,
+    admission: MarketAdmission,
     ts_init: UnixNanos,
 ) -> anyhow::Result<BinaryOption> {
     let market = crate::providers::KalshiInstrumentProvider::load_market(http, ticker).await?;
@@ -860,13 +861,51 @@ pub(super) async fn load_definition(
         .event;
 
     let series = http.get_series(&event.series_ticker).await?.series;
-    crate::providers::KalshiInstrumentProvider::parse(&market, &event, &series, ts_init)
+    crate::providers::KalshiInstrumentProvider::parse(&market, &event, &series, admission, ts_init)
 }
 
+/// Returns the event collateral-return type retained in the definition's metadata.
+pub(super) fn collateral_return_type(
+    instrument: &BinaryOption,
+) -> anyhow::Result<CollateralReturnType> {
+    let value = instrument
+        .info
+        .as_ref()
+        .and_then(|info| info.get("event"))
+        .and_then(|event| event.get("collateral_return_type"))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("instrument lacks event collateral metadata"))?;
+    Ok(serde_json::from_value(value)?)
+}
+
+/// Returns whether the definition's event declares collateral-return netting.
+pub(super) fn collateral_netting(instrument: &BinaryOption) -> anyhow::Result<bool> {
+    Ok(collateral_return_type(instrument)? != CollateralReturnType::None)
+}
+
+/// Checks a loaded or cached definition against the client's shard and admission policy.
+///
+/// A data client can cache netting-event definitions which this execution client does not admit.
 pub(super) fn validate_definition(
     instrument: &BinaryOption,
     exchange_index: u32,
+    admission: MarketAdmission,
 ) -> anyhow::Result<()> {
+    let reason = match collateral_return_type(instrument)? {
+        CollateralReturnType::None => None,
+        CollateralReturnType::Other(_) => Some(MarketRefusalReason::UnknownCollateral),
+        _ if admission.collateral_netting => None,
+        _ => Some(MarketRefusalReason::CollateralNetting),
+    };
+
+    if let Some(reason) = reason {
+        return Err(MarketRefusal {
+            ticker: instrument.raw_symbol.to_string(),
+            reason,
+        }
+        .into());
+    }
+
     let shard = instrument
         .info
         .as_ref()
@@ -882,6 +921,7 @@ pub(super) fn validate_definition(
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::params::Params;
     use rstest::rstest;
 
     use super::*;
@@ -924,5 +964,62 @@ mod tests {
                 ),
             }
         }
+    }
+
+    fn netting_definition(kind: &str) -> BinaryOption {
+        let f: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_data/instruments.json")).unwrap();
+        let market = serde_json::from_value(f["definitions"]["live"]["market"].clone()).unwrap();
+        let event = serde_json::from_value(f["definitions"]["live"]["event"].clone()).unwrap();
+        let mut instrument =
+            crate::http::parse::parse_instrument(&market, &event, UnixNanos::from(1)).unwrap();
+        let mut info = instrument.info.as_deref().cloned().unwrap();
+        info["event"]["collateral_return_type"] = kind.into();
+        instrument.info = Some(Params::new(info));
+        instrument
+    }
+
+    #[rstest]
+    #[case("", false, None)]
+    #[case("", true, None)]
+    #[case("MECNET", false, Some(MarketRefusalReason::CollateralNetting))]
+    #[case("DIRECNET", false, Some(MarketRefusalReason::CollateralNetting))]
+    #[case("MECNET", true, None)]
+    #[case("DIRECNET", true, None)]
+    #[case("future", false, Some(MarketRefusalReason::UnknownCollateral))]
+    #[case("future", true, Some(MarketRefusalReason::UnknownCollateral))]
+    fn cached_definitions_follow_the_collateral_admission_policy(
+        #[case] kind: &str,
+        #[case] admit: bool,
+        #[case] refusal: Option<MarketRefusalReason>,
+    ) {
+        let instrument = netting_definition(kind);
+        let admission = MarketAdmission {
+            collateral_netting: admit,
+        };
+
+        assert_eq!(collateral_netting(&instrument).unwrap(), !kind.is_empty());
+        let result = validate_definition(&instrument, 2, admission);
+        assert_eq!(
+            result.err().map(|e| e.downcast::<MarketRefusal>().unwrap()),
+            refusal.map(|reason| MarketRefusal {
+                ticker: instrument.raw_symbol.to_string(),
+                reason,
+            })
+        );
+    }
+
+    #[rstest]
+    fn definition_without_event_collateral_metadata_fails_closed() {
+        let mut instrument = netting_definition("");
+        let mut info = instrument.info.as_deref().cloned().unwrap();
+        info.shift_remove("event");
+        instrument.info = Some(Params::new(info));
+        assert_eq!(
+            validate_definition(&instrument, 2, MarketAdmission::default())
+                .unwrap_err()
+                .to_string(),
+            "instrument lacks event collateral metadata"
+        );
     }
 }

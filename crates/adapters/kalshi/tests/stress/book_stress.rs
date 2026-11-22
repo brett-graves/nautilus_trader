@@ -383,6 +383,7 @@ impl StressVenue for Kalshi {
             update_instruments_interval_mins: 60,
             transport_backend: TransportBackend::Sockudo,
             instrument_ids: self.instruments.clone(),
+            admit_collateral_netting: false,
         };
 
         let sender = get_data_event_sender();

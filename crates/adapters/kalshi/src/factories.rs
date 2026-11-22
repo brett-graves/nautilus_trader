@@ -259,6 +259,7 @@ mod tests {
             update_instruments_interval_mins: 23,
             transport_backend: TransportBackend::Sockudo,
             instrument_ids: vec![InstrumentId::from("KXHIGHNY-26OCT31-T70.KALSHI")],
+            admit_collateral_netting: false,
         }
     }
 
@@ -276,6 +277,7 @@ mod tests {
             exchange_index: 3,
             subaccount: 7,
             transport_backend: TransportBackend::Sockudo,
+            admit_collateral_netting: false,
         }
     }
 

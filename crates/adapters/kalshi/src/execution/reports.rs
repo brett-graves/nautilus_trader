@@ -26,7 +26,7 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 
-use super::timestamp;
+use super::{snapshot::collateral_netting, timestamp};
 use crate::{
     common::{enums::OrderType as VenueOrderType, parse::parse_instrument_id},
     data::parse::{price, size},
@@ -320,6 +320,14 @@ pub(super) fn position(
     );
     let signed = value.position_fp.0;
 
+    // Returned collateral is outside the signed-binary cash model, so netting must be disproved
+    anyhow::ensure!(
+        signed.is_zero()
+            || value.netting_enabled == Field::Value(false)
+            || !collateral_netting(instrument)?,
+        "position event applies collateral-return netting or does not disprove it"
+    );
+
     let side = if signed > Decimal::ZERO {
         PositionSide::Long
     } else if signed < Decimal::ZERO {
@@ -391,7 +399,7 @@ fn client_id(value: &str) -> anyhow::Result<Option<ClientOrderId>> {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_core::UUID4;
+    use nautilus_core::{UUID4, params::Params};
     use nautilus_model::{
         events::{OrderAccepted, OrderCanceled, OrderEventAny, OrderRejected, OrderSubmitted},
         orders::builder::OrderTestBuilder,
@@ -918,6 +926,54 @@ mod tests {
         );
         assert_ne!(aggregate.ts_last, rejected_at);
         assert!(aggregate.post_only);
+    }
+
+    #[rstest]
+    #[case("", "-2.75", Field::Missing, true)]
+    #[case("", "-2.75", Field::Value(true), true)]
+    #[case("MECNET", "-2.75", Field::Value(false), true)]
+    #[case("DIRECNET", "2.75", Field::Value(false), true)]
+    #[case("MECNET", "0.00", Field::Value(true), true)]
+    #[case("MECNET", "0.00", Field::Missing, true)]
+    #[case("MECNET", "-2.75", Field::Value(true), false)]
+    #[case("MECNET", "-2.75", Field::Missing, false)]
+    #[case("MECNET", "2.75", Field::Null, false)]
+    #[case("DIRECNET", "2.75", Field::Value(true), false)]
+    fn netting_event_position_requires_disproved_netting(
+        #[case] kind: &str,
+        #[case] signed: &str,
+        #[case] netting_enabled: Field<bool>,
+        #[case] accepted: bool,
+    ) {
+        let mut instrument = instrument();
+        let mut info = instrument.info.as_deref().cloned().unwrap();
+        info["event"]["collateral_return_type"] = kind.into();
+        instrument.info = Some(Params::new(info));
+
+        let mut value: MarketPosition =
+            serde_json::from_value(fixture("positions")["market_positions"][0].clone()).unwrap();
+        value.ticker = instrument.id.symbol.to_string();
+        value.position_fp = FixedPoint(signed.parse().unwrap());
+        value.netting_enabled = netting_enabled;
+
+        let result = position(
+            &value,
+            &instrument,
+            AccountId::from("KALSHI-007"),
+            UnixNanos::from(543),
+        );
+
+        if accepted {
+            assert_eq!(
+                result.unwrap().signed_decimal_qty,
+                signed.parse::<Decimal>().unwrap()
+            );
+        } else {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "position event applies collateral-return netting or does not disprove it"
+            );
+        }
     }
 
     #[rstest]

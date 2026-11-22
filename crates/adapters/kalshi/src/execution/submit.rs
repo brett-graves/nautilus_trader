@@ -31,7 +31,7 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 
-use super::{account, context::PrivateState};
+use super::{account, context::PrivateState, snapshot::collateral_netting};
 use crate::{
     common::{
         enums::{MarketStatus, MarketType},
@@ -44,7 +44,7 @@ use crate::{
             BookSide, CreateOrderResponse, Field, FixedPoint, SelfTradePrevention,
             TimeInForce as VenueTimeInForce, VenueError,
         },
-        query::CreateOrderRequest,
+        query::{AccountQuery, CreateOrderRequest},
     },
     websocket::client::KalshiWebSocketClient,
 };
@@ -325,6 +325,19 @@ pub(super) async fn prepare(
             request.exchange_index == 0,
             "Kalshi shard availability is unknown"
         );
+    }
+
+    if collateral_netting(definition)? {
+        // The signed-binary cash model holds only while the venue never returns collateral
+        account::check_netting_disabled(
+            http,
+            definition,
+            &AccountQuery {
+                subaccount: request.subaccount,
+                exchange_index: request.exchange_index,
+            },
+        )
+        .await?;
     }
 
     account::hold(

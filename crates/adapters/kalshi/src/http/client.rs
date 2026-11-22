@@ -475,6 +475,21 @@ impl KalshiHttpClient {
         self.get(&["portfolio", "positions"], query, true).await
     }
 
+    /// Fetches the collateral-return netting setting of every subaccount.
+    ///
+    /// The setting governs a subaccount's first order in an event. Positions report the value
+    /// fixed for their event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authentication, transport, cancellation, status, or decoding fails.
+    pub async fn get_subaccount_netting(
+        &self,
+    ) -> Result<SubaccountNettingResponse, KalshiHttpError> {
+        self.get(&["portfolio", "subaccounts", "netting"], &(), true)
+            .await
+    }
+
     /// Fetches one archived market/event position page.
     ///
     /// # Errors

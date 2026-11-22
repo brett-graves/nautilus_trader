@@ -38,6 +38,8 @@ class KalshiDataClientConfig:
     def transport_backend(self) -> network.TransportBackend: ...
     @property
     def instrument_ids(self) -> list[model.InstrumentId]: ...
+    @property
+    def admit_collateral_netting(self) -> bool: ...
     def __init__(
         self,
         api_key_id: str | None = None,
@@ -52,6 +54,7 @@ class KalshiDataClientConfig:
         transport_backend: network.TransportBackend | None = None,
         book_snapshot_timeout_secs: int | None = None,
         instrument_ids: typing.Sequence[model.InstrumentId] | None = None,
+        admit_collateral_netting: bool | None = None,
     ) -> None: ...
     @property
     def has_credentials(self) -> bool: ...
@@ -79,6 +82,8 @@ class KalshiExecutionClientConfig:
     def subaccount(self) -> int: ...
     @property
     def transport_backend(self) -> network.TransportBackend: ...
+    @property
+    def admit_collateral_netting(self) -> bool: ...
     def __init__(
         self,
         account_id: model.AccountId | None = None,
@@ -93,6 +98,7 @@ class KalshiExecutionClientConfig:
         exchange_index: int | None = None,
         transport_backend: network.TransportBackend | None = None,
         subaccount: int | None = None,
+        admit_collateral_netting: bool | None = None,
     ) -> None: ...
     @property
     def has_credentials(self) -> bool: ...

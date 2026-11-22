@@ -9,5 +9,6 @@
   "ws_timeout_secs": 19,
   "transport_backend": "sockudo",
   "account_id": "KALSHI-TEST",
-  "exchange_index": 3
+  "exchange_index": 3,
+  "admit_collateral_netting": true
 }

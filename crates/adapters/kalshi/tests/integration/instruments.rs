@@ -31,7 +31,10 @@ use nautilus_kalshi::{
     http::{
         client::KalshiHttpClient,
         models::{Event, Field, FixedPoint, Market, PriceRange},
-        parse::{MarketRefusal, MarketRefusalReason, parse_instrument, parse_instrument_close},
+        parse::{
+            MarketAdmission, MarketRefusal, MarketRefusalReason, parse_instrument,
+            parse_instrument_admitting, parse_instrument_close,
+        },
     },
     providers::KalshiInstrumentProvider,
 };
@@ -331,7 +334,84 @@ fn captured_netting_event_is_rejected() {
             .unwrap_err()
             .to_string(),
         "unsupported market economics or family for KXESOCCERGAME-26OCT170222MORDSTRU-TIE: \
-         event uses MECNET or DIRECNET collateral-return netting"
+         event uses MECNET or DIRECNET collateral-return netting, \
+         which requires `admit_collateral_netting`"
+    );
+}
+
+#[rstest]
+#[case("unsupported", "MECNET", "KXESOCCERGAME-26OCT170222MORDSTRU-TIE")]
+#[case("decimal_strike", "DIRECNET", "KXBTCD-26OCT1717-T91749.99")]
+fn captured_netting_event_is_admitted_only_by_explicit_policy(
+    #[case] name: &str,
+    #[case] kind: &str,
+    #[case] ticker: &str,
+) {
+    let (market, event) = definition(name);
+    let admission = MarketAdmission {
+        collateral_netting: true,
+    };
+    assert!(!MarketAdmission::default().collateral_netting);
+    assert!(parse_instrument(&market, &event, UnixNanos::from(1)).is_err());
+
+    let instrument =
+        parse_instrument_admitting(&market, &event, admission, UnixNanos::from(1)).unwrap();
+    let (_, mut plain) = definition(name);
+    plain.collateral_return_type = "".parse().unwrap();
+    let ordinary = parse_instrument(&market, &plain, UnixNanos::from(1)).unwrap();
+
+    assert_eq!(instrument.id, parse_instrument_id(ticker).unwrap());
+    assert_eq!(instrument.raw_symbol.as_str(), ticker);
+    assert_eq!(instrument.outcome.unwrap().as_str(), "YES");
+    assert_eq!(instrument.currency, Currency::USD());
+    assert_eq!(
+        instrument.event_id.unwrap().as_str(),
+        event.event_ticker.as_str()
+    );
+    assert_eq!(
+        instrument.info.as_ref().unwrap()["event"]["collateral_return_type"],
+        kind
+    );
+    assert_eq!(
+        instrument.info.as_ref().unwrap()["event"]["mutually_exclusive"],
+        kind == "MECNET"
+    );
+
+    // Netting changes only the retained event metadata, never the contract terms
+    assert_eq!(instrument.price_increment, ordinary.price_increment);
+    assert_eq!(instrument.size_increment, ordinary.size_increment);
+    assert_eq!(instrument.price_precision, ordinary.price_precision);
+    assert_eq!(instrument.size_precision, ordinary.size_precision);
+    assert_eq!(instrument.activation_ns, ordinary.activation_ns);
+    assert_eq!(instrument.expiration_ns, ordinary.expiration_ns);
+    assert_eq!(instrument.tick_scheme, ordinary.tick_scheme);
+}
+
+#[rstest]
+fn explicit_netting_policy_still_rejects_unknown_collateral_and_other_rules() {
+    let admission = MarketAdmission {
+        collateral_netting: true,
+    };
+    let (market, mut event) = definition("unsupported");
+    event.collateral_return_type = "future".parse().unwrap();
+    assert_eq!(
+        parse_instrument_admitting(&market, &event, admission, UnixNanos::from(1))
+            .unwrap_err()
+            .downcast::<MarketRefusal>()
+            .unwrap()
+            .reason,
+        MarketRefusalReason::UnknownCollateral
+    );
+
+    let (mut market, event) = definition("unsupported");
+    market.settlement_floor_dollars = Field::Value(FixedPoint(Decimal::new(1, 1)));
+    assert_eq!(
+        parse_instrument_admitting(&market, &event, admission, UnixNanos::from(1))
+            .unwrap_err()
+            .downcast::<MarketRefusal>()
+            .unwrap()
+            .reason,
+        MarketRefusalReason::SettlementFloor
     );
 }
 

@@ -46,7 +46,7 @@ use crate::{
         client::KalshiHttpClient,
         error::KalshiHttpError,
         models::{Event, Field, Market, Series},
-        parse::{check_admission, parse_instrument},
+        parse::{MarketAdmission, check_admission, parse_instrument_admitting},
         query::{EventQuery, HistoricalMarketsQuery, MarketsQuery},
     },
 };
@@ -78,6 +78,7 @@ pub struct KalshiInstrumentProvider {
     pub(crate) http: KalshiHttpClient,
     pub(crate) clock: &'static AtomicTime,
     sender: EventSender<DataEvent>,
+    admission: MarketAdmission,
 }
 
 impl KalshiInstrumentProvider {
@@ -91,7 +92,15 @@ impl KalshiInstrumentProvider {
             http,
             clock,
             sender,
+            admission: MarketAdmission::default(),
         }
+    }
+
+    /// Replaces the admission policy applied to every loaded definition.
+    #[must_use]
+    pub const fn with_admission(mut self, admission: MarketAdmission) -> Self {
+        self.admission = admission;
+        self
     }
 
     /// Fetches a fresh definition, falling back to the archive only after a live-market 404.
@@ -234,7 +243,7 @@ impl KalshiInstrumentProvider {
                 continue;
             }
 
-            if let Err(refusal) = check_admission(&market, event) {
+            if let Err(refusal) = check_admission(&market, event, self.admission) {
                 log::debug!("Kalshi instrument discovery skipped a market: {refusal}");
                 continue;
             }
@@ -248,6 +257,7 @@ impl KalshiInstrumentProvider {
                 &market,
                 event,
                 &series[&event.series_ticker],
+                self.admission,
                 self.clock.get_time_ns(),
             )?;
 
@@ -299,7 +309,13 @@ impl KalshiInstrumentProvider {
             selection.matches(&market, &event),
             "definition does not satisfy request filters"
         );
-        let instrument = Self::parse(&market, &event, &series, self.clock.get_time_ns())?;
+        let instrument = Self::parse(
+            &market,
+            &event,
+            &series,
+            self.admission,
+            self.clock.get_time_ns(),
+        )?;
         anyhow::ensure!(
             start.is_none_or(|t| instrument.ts_event >= t)
                 && end.is_none_or(|t| instrument.ts_event <= t),
@@ -338,13 +354,14 @@ impl KalshiInstrumentProvider {
         market: &Market,
         event: &Event,
         series: &Series,
+        admission: MarketAdmission,
         ts_init: UnixNanos,
     ) -> anyhow::Result<BinaryOption> {
         anyhow::ensure!(
             series.ticker == event.series_ticker,
             "requested series identity mismatch"
         );
-        let mut instrument = parse_instrument(market, event, ts_init)?;
+        let mut instrument = parse_instrument_admitting(market, event, admission, ts_init)?;
         // Keep exact fee metadata out of serde_json's floating-point number path
         let serialized = serde_json::to_string(series)?;
         let fields: HashMap<String, Box<serde_json::value::RawValue>> =
@@ -652,9 +669,14 @@ mod tests {
         let clock = Box::leak(Box::new(AtomicTime::new(false, UnixNanos::from(31))));
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         let provider = KalshiInstrumentProvider::new(http, clock, sender.into());
-        let instrument =
-            KalshiInstrumentProvider::parse(&market, &event, &series, provider.clock.get_time_ns())
-                .unwrap();
+        let instrument = KalshiInstrumentProvider::parse(
+            &market,
+            &event,
+            &series,
+            MarketAdmission::default(),
+            provider.clock.get_time_ns(),
+        )
+        .unwrap();
         assert_eq!(
             instrument.info.as_ref().unwrap()["series"]["fee_multiplier"],
             exact

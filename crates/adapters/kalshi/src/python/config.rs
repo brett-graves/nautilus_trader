@@ -44,6 +44,7 @@ impl KalshiDataClientConfig {
         transport_backend = None,
         book_snapshot_timeout_secs = None,
         instrument_ids = None,
+        admit_collateral_netting = None,
     ))]
     #[expect(
         clippy::too_many_arguments,
@@ -62,6 +63,7 @@ impl KalshiDataClientConfig {
         transport_backend: Option<TransportBackend>,
         book_snapshot_timeout_secs: Option<u64>,
         instrument_ids: Option<Vec<InstrumentId>>,
+        admit_collateral_netting: Option<bool>,
     ) -> PyResult<Self> {
         let defaults = Self::default();
 
@@ -80,6 +82,8 @@ impl KalshiDataClientConfig {
                 .unwrap_or(defaults.update_instruments_interval_mins),
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
             instrument_ids: instrument_ids.unwrap_or(defaults.instrument_ids),
+            admit_collateral_netting: admit_collateral_netting
+                .unwrap_or(defaults.admit_collateral_netting),
         };
 
         config.validate().map_err(config_error_to_pyvalue_err)?;
@@ -111,7 +115,7 @@ impl KalshiDataClientConfig {
 impl KalshiExecutionClientConfig {
     /// Configuration for the Kalshi execution client.
     #[new]
-    #[pyo3(signature = (account_id = None, api_key_id = None, private_key = None, environment = None, base_url_http = None, base_url_ws = None, proxy_url = None, http_timeout_secs = None, ws_timeout_secs = None, exchange_index = None, transport_backend = None, subaccount = None))]
+    #[pyo3(signature = (account_id = None, api_key_id = None, private_key = None, environment = None, base_url_http = None, base_url_ws = None, proxy_url = None, http_timeout_secs = None, ws_timeout_secs = None, exchange_index = None, transport_backend = None, subaccount = None, admit_collateral_netting = None))]
     #[expect(
         clippy::too_many_arguments,
         reason = "thin projection of the Rust config fields"
@@ -129,6 +133,7 @@ impl KalshiExecutionClientConfig {
         exchange_index: Option<u32>,
         transport_backend: Option<TransportBackend>,
         subaccount: Option<u32>,
+        admit_collateral_netting: Option<bool>,
     ) -> PyResult<Self> {
         let defaults = Self::default();
 
@@ -145,6 +150,8 @@ impl KalshiExecutionClientConfig {
             ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
             exchange_index: exchange_index.unwrap_or(defaults.exchange_index),
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
+            admit_collateral_netting: admit_collateral_netting
+                .unwrap_or(defaults.admit_collateral_netting),
         };
 
         config.validate().map_err(config_error_to_pyvalue_err)?;
@@ -213,6 +220,7 @@ mod tests {
                 .set_item("environment", KalshiEnvironment::Demo)
                 .unwrap();
             kwargs.set_item("transport_backend", backend).unwrap();
+            kwargs.set_item("admit_collateral_netting", true).unwrap();
             if name == "KalshiDataClientConfig" {
                 kwargs.set_item("book_snapshot_timeout_secs", 31).unwrap();
                 kwargs
@@ -249,6 +257,7 @@ mod tests {
                     book_snapshot_timeout_secs: 31,
                     transport_backend: backend,
                     instrument_ids: vec![InstrumentId::from("KXHIGHNY-26OCT31-T70.KALSHI")],
+                    admit_collateral_netting: true,
                 };
 
                 assert_eq!(actual, expected);
@@ -272,6 +281,7 @@ mod tests {
                     exchange_index: 3,
                     transport_backend: backend,
                     subaccount: 7,
+                    admit_collateral_netting: true,
                 };
 
                 assert_eq!(actual, expected);

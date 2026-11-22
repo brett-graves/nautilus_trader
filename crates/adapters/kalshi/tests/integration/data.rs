@@ -343,6 +343,52 @@ async fn explicit_requests_refresh_context_and_preserve_correlation_filters_and_
 }
 
 #[tokio::test]
+async fn netting_event_bootstrap_requires_explicit_admission() {
+    tokio::time::timeout(Duration::from_secs(12), async {
+        let peer = Peer::new().await;
+        let id = ids()[0];
+        peer.revision.store(99, Ordering::SeqCst);
+
+        let (sender, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut refused = KalshiDataClient::new(
+            *KALSHI_CLIENT_ID,
+            peer.config.clone(),
+            vec![id],
+            sender.into(),
+        )
+        .unwrap();
+        let error = refused.connect().await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<MarketRefusal>(),
+            Some(&MarketRefusal {
+                ticker: id.symbol.to_string(),
+                reason: MarketRefusalReason::CollateralNetting,
+            })
+        );
+        assert!(refused.is_disconnected());
+
+        let mut config = peer.config.clone();
+        config.admit_collateral_netting = true;
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let mut admitted =
+            KalshiDataClient::new(*KALSHI_CLIENT_ID, config, vec![id], sender.into()).unwrap();
+        admitted.connect().await.unwrap();
+        assert!(admitted.is_connected());
+
+        let instrument = definition(&mut events).await;
+        assert_eq!(instrument.id, id);
+        assert_eq!(instrument.outcome.unwrap().as_str(), "YES");
+        assert_eq!(
+            instrument.info.as_ref().unwrap()["event"]["collateral_return_type"],
+            "DIRECNET"
+        );
+        admitted.disconnect().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn failed_bootstrap_canceled_connect_and_idle_closed_consumer_release_sessions() {
     tokio::time::timeout(Duration::from_secs(12), async {
         let mut peer = Peer::new().await;

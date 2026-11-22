@@ -134,7 +134,9 @@ impl KalshiDataClient {
 
         let http = KalshiHttpClient::new(&config)?;
         let clock = get_atomic_clock_realtime();
-        let provider = KalshiInstrumentProvider::new(http, clock, sender.clone());
+        let provider = KalshiInstrumentProvider::new(http, clock, sender.clone())
+            .with_admission(config.admission());
+        let lifecycle = LifecycleTracker::new(config.admission());
 
         let books = BookSyncTracker::new(
             &instruments,
@@ -156,7 +158,7 @@ impl KalshiDataClient {
             instruments,
             context: Arc::default(),
             demand: Arc::default(),
-            lifecycle: Arc::default(),
+            lifecycle: Arc::new(lifecycle),
             books,
         })
     }

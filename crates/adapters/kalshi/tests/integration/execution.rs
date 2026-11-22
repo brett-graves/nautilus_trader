@@ -30,7 +30,10 @@ use nautilus_kalshi::{
     execution::{KalshiExecutionClient, collect_snapshot},
     http::{
         models::{Event, Field, Fill, Market, MarketPosition, Order as VenueOrder},
-        parse::parse_instrument,
+        parse::{
+            MarketAdmission, MarketRefusal, MarketRefusalReason, parse_instrument,
+            parse_instrument_admitting,
+        },
         query::AccountQuery,
     },
 };
@@ -1474,6 +1477,142 @@ async fn unloaded_report_definitions_resolve_or_fail_closed(#[case] mode: &'stat
             );
         } else {
             assert!(result.is_err());
+        }
+
+        peer.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[rstest]
+#[case::cached_not_admitted(false, true, Some(false), Err("refused"))]
+#[case::unloaded_not_admitted(false, false, Some(false), Err("refused"))]
+#[case::cached_admitted(true, true, Some(false), Ok(()))]
+#[case::unloaded_admitted(true, false, Some(false), Ok(()))]
+#[case::netting_applies(true, true, Some(true), Err("netting"))]
+#[case::netting_unproven(true, true, None, Err("netting"))]
+#[tokio::test]
+async fn netting_event_position_reports_follow_admission_and_venue_evidence(
+    #[case] admit: bool,
+    #[case] cached: bool,
+    #[case] netting_enabled: Option<bool>,
+    #[case] expected: Result<(), &'static str>,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let definitions: Value =
+            serde_json::from_str(include_str!("../../test_data/instruments.json")).unwrap();
+        let mut market = definitions["definitions"]["live"]["market"].clone();
+        let mut event = definitions["definitions"]["live"]["event"].clone();
+        market["exchange_index"] = 3.into();
+        event["exchange_index"] = 3.into();
+        event["collateral_return_type"] = "MECNET".into();
+        event["mutually_exclusive"] = true.into();
+
+        let instrument = parse_instrument_admitting(
+            &serde_json::from_value(market.clone()).unwrap(),
+            &serde_json::from_value(event.clone()).unwrap(),
+            MarketAdmission {
+                collateral_netting: true,
+            },
+            UnixNanos::from(1),
+        )
+        .unwrap();
+
+        let mut f = fixtures();
+        let position = &mut f["positions"]["market_positions"][0];
+        position["ticker"] = instrument.id.symbol.as_str().into();
+        if let Some(enabled) = netting_enabled {
+            position["netting_enabled"] = enabled.into();
+        }
+
+        let mut series = definitions["series"].clone();
+        series["series"]["ticker"] = event["series_ticker"].clone();
+
+        let (listener, address) = http::bind_peer(0).await;
+        let peer = tokio::spawn(async move {
+            rest::quota_discovery(&listener).await;
+            rest::reply(&listener, 200, f["positions"].clone()).await;
+
+            if !cached {
+                let request =
+                    rest::reply(&listener, 200, serde_json::json!({"market": market})).await;
+                assert!(request.starts_with("GET /custom/v3/markets/"));
+                let request = rest::reply(
+                    &listener,
+                    200,
+                    serde_json::json!({"event": event, "markets": []}),
+                )
+                .await;
+                assert!(request.starts_with("GET /custom/v3/events/"));
+                let request = rest::reply(&listener, 200, series).await;
+                assert!(request.starts_with("GET /custom/v3/series/"));
+            }
+        });
+
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        if cached {
+            cache
+                .borrow_mut()
+                .add_instrument(InstrumentAny::BinaryOption(instrument.clone()))
+                .unwrap();
+        }
+
+        let config = KalshiExecutionClientConfig {
+            api_key_id: Some("auth-test-id".into()),
+            private_key: Some(keys::ed25519_pkcs8().into()),
+            base_url_http: Some(format!("http://{address}/custom/v3").into()),
+            http_timeout_secs: 1,
+            exchange_index: 3,
+            admit_collateral_netting: admit,
+            ..Default::default()
+        };
+
+        let core = ExecutionClientCore::new(
+            "TRADER-001".into(),
+            "TEST".into(),
+            *KALSHI_VENUE,
+            OmsType::Netting,
+            config.account_id,
+            AccountType::Cash,
+            Some(Currency::USD()),
+            Rc::clone(&cache),
+        );
+        let client = KalshiExecutionClient::new(core, config).unwrap();
+
+        let command = GeneratePositionStatusReports::new(
+            UUID4::new(),
+            UnixNanos::from(1),
+            Some(instrument.id),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let result = client.generate_position_status_reports(&command).await;
+
+        match expected {
+            Ok(()) => {
+                let positions = result.unwrap();
+                assert_eq!(positions.len(), 1);
+                assert_eq!(positions[0].instrument_id, instrument.id);
+                assert_eq!(
+                    positions[0].signed_decimal_qty,
+                    "-2.75".parse::<rust_decimal::Decimal>().unwrap()
+                );
+            }
+            Err("refused") => assert_eq!(
+                result.unwrap_err().downcast::<MarketRefusal>().unwrap(),
+                MarketRefusal {
+                    ticker: instrument.id.symbol.to_string(),
+                    reason: MarketRefusalReason::CollateralNetting,
+                }
+            ),
+            Err(_) => assert_eq!(
+                result.unwrap_err().to_string(),
+                "position event applies collateral-return netting or does not disprove it"
+            ),
         }
 
         peer.await.unwrap();

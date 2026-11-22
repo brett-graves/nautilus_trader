@@ -439,6 +439,24 @@ pub struct MarketPosition {
     pub realized_pnl_dollars: FixedPoint,
     pub fees_paid_dollars: FixedPoint,
     pub last_updated_ts: Timestamp,
+    /// Whether collateral-return netting applies to the position's event, fixed at the
+    /// subaccount's first order in that event.
+    #[serde(default, skip_serializing_if = "Field::is_missing")]
+    pub netting_enabled: Field<bool>,
+}
+
+/// Collateral-return netting setting for one subaccount and exchange shard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubaccountNetting {
+    pub subaccount_number: u32,
+    pub enabled: bool,
+    pub exchange_index: u32,
+}
+
+/// Collateral-return netting settings for every subaccount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubaccountNettingResponse {
+    pub netting_configs: Vec<SubaccountNetting>,
 }
 
 /// Event-level position economics.

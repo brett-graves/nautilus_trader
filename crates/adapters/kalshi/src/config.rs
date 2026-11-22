@@ -34,7 +34,7 @@ use crate::{
         parse::parse_ticker,
         urls::{kalshi_http_base_url, kalshi_ws_url},
     },
-    http::query::AccountQuery,
+    http::{parse::MarketAdmission, query::AccountQuery},
 };
 
 /// Configuration for the Kalshi data client.
@@ -81,6 +81,10 @@ pub struct KalshiDataClientConfig {
     /// requires at least one distinct Kalshi instrument ID.
     #[builder(default)]
     pub instrument_ids: Vec<InstrumentId>,
+    /// Admits markets whose event declares `MECNET` or `DIRECNET` collateral-return netting.
+    /// Netting does not change the market definition or its data.
+    #[builder(default)]
+    pub admit_collateral_netting: bool,
 }
 
 #[cfg(feature = "python")]
@@ -92,6 +96,7 @@ nautilus_core::impl_pyo3_config_getters!(KalshiDataClientConfig {
     book_snapshot_timeout_secs: u64,
     transport_backend: TransportBackend,
     instrument_ids: Vec<InstrumentId>,
+    admit_collateral_netting: bool,
 });
 
 impl Default for KalshiDataClientConfig {
@@ -135,6 +140,14 @@ impl KalshiDataClientConfig {
             || kalshi_ws_url(self.environment),
             SecretString::expose_secret,
         )
+    }
+
+    /// Returns the market admission policy this client applies to every definition.
+    #[must_use]
+    pub const fn admission(&self) -> MarketAdmission {
+        MarketAdmission {
+            collateral_netting: self.admit_collateral_netting,
+        }
     }
 
     /// Validates explicit credentials, endpoints, and supported timing values.
@@ -232,6 +245,11 @@ pub struct KalshiExecutionClientConfig {
     /// Selected subaccount in [0, 63]; zero selects the primary account.
     #[builder(default)]
     pub subaccount: u32,
+    /// Admits markets whose event declares `MECNET` or `DIRECNET` collateral-return netting,
+    /// while Kalshi reports netting disabled for the subaccount and shard. The client never
+    /// models returned collateral.
+    #[builder(default)]
+    pub admit_collateral_netting: bool,
 }
 
 #[cfg(feature = "python")]
@@ -243,6 +261,7 @@ nautilus_core::impl_pyo3_config_getters!(KalshiExecutionClientConfig {
     exchange_index: u32,
     subaccount: u32,
     transport_backend: TransportBackend,
+    admit_collateral_netting: bool,
 });
 
 impl Default for KalshiExecutionClientConfig {
@@ -286,6 +305,14 @@ impl KalshiExecutionClientConfig {
             || kalshi_ws_url(self.environment),
             SecretString::expose_secret,
         )
+    }
+
+    /// Returns the market admission policy this client applies to every definition.
+    #[must_use]
+    pub const fn admission(&self) -> MarketAdmission {
+        MarketAdmission {
+            collateral_netting: self.admit_collateral_netting,
+        }
     }
 
     /// Validates the subaccount, explicit credentials, endpoints, and positive timing values.
@@ -518,6 +545,7 @@ mod tests {
                 book_snapshot_timeout_secs: DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS,
                 transport_backend: TransportBackend::Sockudo,
                 instrument_ids: Vec::new(),
+                admit_collateral_netting: false,
             }
         );
         assert_eq!(
@@ -535,6 +563,7 @@ mod tests {
                 exchange_index: 0,
                 subaccount: 0,
                 transport_backend: TransportBackend::Sockudo,
+                admit_collateral_netting: false,
             }
         );
         assert!(!data.has_credentials());
@@ -617,6 +646,7 @@ mod tests {
             .http_timeout_secs(17)
             .ws_timeout_secs(19)
             .update_instruments_interval_mins(23)
+            .admit_collateral_netting(true)
             .book_snapshot_timeout_secs(31)
             .transport_backend(TransportBackend::Sockudo)
             .instrument_ids(vec![InstrumentId::from("KXBTC15M-26OCT31-T100000.KALSHI")])
@@ -634,6 +664,7 @@ mod tests {
             .http_timeout_secs(17)
             .ws_timeout_secs(19)
             .exchange_index(3)
+            .admit_collateral_netting(true)
             .transport_backend(TransportBackend::Sockudo)
             .build();
         let round_trip_data: KalshiDataClientConfig =

@@ -10,5 +10,6 @@
   "transport_backend": "sockudo",
   "update_instruments_interval_mins": 23,
   "book_snapshot_timeout_secs": 31,
-  "instrument_ids": ["KXBTC15M-26OCT31-T100000.KALSHI"]
+  "instrument_ids": ["KXBTC15M-26OCT31-T100000.KALSHI"],
+  "admit_collateral_netting": true
 }

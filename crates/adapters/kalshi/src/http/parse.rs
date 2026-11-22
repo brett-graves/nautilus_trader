@@ -159,6 +159,17 @@ impl Pagination {
     }
 }
 
+/// Market economics a client admits beyond ordinary un-netted binary contracts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MarketAdmission {
+    /// Admits events whose `collateral_return_type` is `MECNET` or `DIRECNET`.
+    ///
+    /// Netting is a subaccount setting. The market definition and its YES-priced contract are the
+    /// same with or without it. An execution client must separately establish that netting does
+    /// not apply to its subaccount before it trades or accounts for such an event.
+    pub collateral_netting: bool,
+}
+
 /// The first admission rule a market fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MarketRefusalReason {
@@ -168,7 +179,9 @@ pub enum MarketRefusalReason {
     Notional,
     #[error("settlement bounds are not default")]
     SettlementBounds,
-    #[error("event uses MECNET or DIRECNET collateral-return netting")]
+    #[error(
+        "event uses MECNET or DIRECNET collateral-return netting, which requires `admit_collateral_netting`"
+    )]
     CollateralNetting,
     #[error("event collateral-return type is unknown")]
     UnknownCollateral,
@@ -204,7 +217,25 @@ pub fn parse_instrument(
     event: &Event,
     ts_init: UnixNanos,
 ) -> anyhow::Result<BinaryOption> {
-    check_admission(market, event)?;
+    parse_instrument_admitting(market, event, MarketAdmission::default(), ts_init)
+}
+
+/// Maps a market to the canonical YES-priced instrument under an explicit admission policy.
+///
+/// Collateral-return netting does not change the mapped instrument. The event metadata retained in
+/// `info["event"]` preserves `collateral_return_type` for consumers which must distinguish it.
+///
+/// # Errors
+///
+/// Returns an error if economics are unsupported, identity or shard is inconsistent, or metadata is invalid.
+/// Unsupported economics return a [`MarketRefusal`].
+pub fn parse_instrument_admitting(
+    market: &Market,
+    event: &Event,
+    admission: MarketAdmission,
+    ts_init: UnixNanos,
+) -> anyhow::Result<BinaryOption> {
+    check_admission(market, event, admission)?;
     anyhow::ensure!(
         market.event_ticker == event.event_ticker,
         "market and event identity mismatch"
@@ -283,7 +314,11 @@ pub fn parse_instrument(
 /// # Errors
 ///
 /// Returns an error if the market fails an admission rule; the [`MarketRefusal`] names both.
-pub fn check_admission(market: &Market, event: &Event) -> Result<(), MarketRefusal> {
+pub fn check_admission(
+    market: &Market,
+    event: &Event,
+    admission: MarketAdmission,
+) -> Result<(), MarketRefusal> {
     let reason = if market.market_type != MarketType::Binary {
         MarketRefusalReason::MarketType
     } else if market.notional_value_dollars.0 != Decimal::ONE {
@@ -292,7 +327,9 @@ pub fn check_admission(market: &Market, event: &Event) -> Result<(), MarketRefus
         MarketRefusalReason::SettlementBounds
     } else if matches!(event.collateral_return_type, CollateralReturnType::Other(_)) {
         MarketRefusalReason::UnknownCollateral
-    } else if event.collateral_return_type != CollateralReturnType::None {
+    } else if event.collateral_return_type != CollateralReturnType::None
+        && !admission.collateral_netting
+    {
         MarketRefusalReason::CollateralNetting
     } else if matches!(&market.settlement_floor_dollars, Field::Value(v) if v.0 != Decimal::ZERO) {
         MarketRefusalReason::SettlementFloor
@@ -326,11 +363,25 @@ pub fn parse_instrument_close(
     event: &Event,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Option<InstrumentClose>> {
+    parse_instrument_close_admitting(market, event, MarketAdmission::default(), ts_init)
+}
+
+/// Returns authoritative final YES payout evidence under an explicit admission policy.
+///
+/// # Errors
+///
+/// Returns an error if [`parse_instrument_close`] would, with admission decided by `admission`.
+pub fn parse_instrument_close_admitting(
+    market: &Market,
+    event: &Event,
+    admission: MarketAdmission,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<InstrumentClose>> {
     if market.status != MarketStatus::Finalized {
         return Ok(None);
     }
 
-    let instrument = parse_instrument(market, event, ts_init)?;
+    let instrument = parse_instrument_admitting(market, event, admission, ts_init)?;
 
     let Field::Value(value) = &market.settlement_value_dollars else {
         anyhow::bail!("finalized market has no settlement value");

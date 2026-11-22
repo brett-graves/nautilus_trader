@@ -25,9 +25,14 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 
+use super::snapshot::collateral_return_type;
 use crate::{
     common::enums::FeeType,
-    http::{client::KalshiHttpClient, models::Field, query::EventQuery},
+    http::{
+        client::KalshiHttpClient,
+        models::Field,
+        query::{AccountQuery, EventQuery, PositionsQuery},
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -223,6 +228,10 @@ pub(super) async fn hold(
         event.event_ticker == event_id.as_str(),
         "fee event identity mismatch"
     );
+    anyhow::ensure!(
+        event.collateral_return_type == collateral_return_type(definition)?,
+        "event collateral-return type changed after the definition was admitted"
+    );
 
     let series = http.get_series(&event.series_ticker).await?.series;
     anyhow::ensure!(
@@ -259,6 +268,58 @@ pub(super) async fn hold(
         .and_then(|unit| unit.checked_mul(qty))
         .context("Kalshi admission hold overflow")?;
     Ok(hold)
+}
+
+/// Verifies from venue evidence that collateral-return netting cannot apply to a new order.
+///
+/// Kalshi fixes netting for an event at the subaccount's first order in that event. Every
+/// position record in the event, flat or not, must therefore report netting disabled, and the
+/// subaccount setting, which governs a first order, must be disabled on the shard. An earlier
+/// order which never filled leaves no position evidence; recovery rejects the resulting netted
+/// position instead.
+pub(super) async fn check_netting_disabled(
+    http: &KalshiHttpClient,
+    definition: &BinaryOption,
+    account: &AccountQuery,
+) -> anyhow::Result<()> {
+    let event_id = definition
+        .event_id
+        .context("pending order event identity is missing")?;
+
+    let positions = http
+        .get_all_positions(
+            PositionsQuery {
+                limit: Some(1000),
+                event_ticker: Some(event_id.to_string()),
+                subaccount: account.subaccount,
+                exchange_index: account.exchange_index,
+                ..Default::default()
+            },
+            100,
+        )
+        .await?;
+
+    anyhow::ensure!(positions.complete, "event position page budget exhausted");
+    anyhow::ensure!(
+        positions
+            .market_positions
+            .iter()
+            .all(|position| position.netting_enabled == Field::Value(false)),
+        "Kalshi collateral-return netting applies to the subaccount's positions in this event"
+    );
+
+    let netting = http.get_subaccount_netting().await?;
+
+    let mut configs = netting.netting_configs.iter().filter(|config| {
+        config.subaccount_number == account.subaccount
+            && config.exchange_index == account.exchange_index
+    });
+
+    anyhow::ensure!(
+        matches!((configs.next(), configs.next()), (Some(config), None) if !config.enabled),
+        "Kalshi collateral-return netting is enabled or unconfirmed for the subaccount"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]

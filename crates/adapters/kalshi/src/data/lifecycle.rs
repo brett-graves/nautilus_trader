@@ -34,7 +34,7 @@ use crate::{
     common::enums::{MarketLifecycleEvent, MarketStatus},
     http::{
         models::{DecimalNumber, Event, Field, Market},
-        parse::{parse_instrument, parse_instrument_close},
+        parse::{MarketAdmission, parse_instrument_admitting, parse_instrument_close_admitting},
     },
     websocket::messages::KalshiDataMessage,
 };
@@ -42,9 +42,17 @@ use crate::{
 #[derive(Debug, Default)]
 pub(super) struct LifecycleTracker {
     state: Mutex<State>,
+    admission: MarketAdmission,
 }
 
 impl LifecycleTracker {
+    pub(super) fn new(admission: MarketAdmission) -> Self {
+        Self {
+            state: Mutex::default(),
+            admission,
+        }
+    }
+
     pub(super) fn begin_recovery(&self) {
         self.state
             .lock()
@@ -124,7 +132,8 @@ impl LifecycleTracker {
             _ => None,
         };
 
-        let final_close = parse_instrument_close(&market, &event, instrument.ts_init)?;
+        let final_close =
+            parse_instrument_close_admitting(&market, &event, self.admission, instrument.ts_init)?;
         let mut state = self.state.lock().expect("lifecycle lock is not poisoned");
         if stamp.epoch != state.epoch {
             return Ok(());
@@ -160,12 +169,12 @@ impl LifecycleTracker {
         }
 
         market = serde_json::from_value(value)?;
-        instrument = rebuild(&instrument, &market, &event)?;
+        instrument = rebuild(&instrument, &market, &event, self.admission)?;
         for (timestamp, _) in entry.overlay.values() {
             instrument.ts_event = instrument.ts_event.max(*timestamp);
         }
 
-        entry.publish(instrument, &market, &event, context, sender)?;
+        entry.publish(instrument, &market, &event, self.admission, context, sender)?;
         entry.serial = stamp.serial;
         entry.version = source_time.or(entry.version);
         entry.overlay.retain(|field, (timestamp, _)| {
@@ -265,10 +274,18 @@ impl LifecycleTracker {
         }
 
         market = serde_json::from_value(value)?;
-        let mut instrument = rebuild(&instrument, &market, &event)?;
+        let mut instrument = rebuild(&instrument, &market, &event, self.admission)?;
         instrument.ts_event = timestamp;
         instrument.ts_init = now;
-        entry.commit(instrument, &market, &event, &mut context, sender)?;
+        entry.commit(
+            instrument,
+            &market,
+            &event,
+            self.admission,
+            &mut context,
+            sender,
+        )?;
+
         for (field, value) in patch {
             entry.overlay.insert(field, (timestamp, value));
         }
@@ -427,11 +444,12 @@ impl Entry {
         instrument: BinaryOption,
         market: &Market,
         event: &Event,
+        admission: MarketAdmission,
         context: &Mutex<HashMap<InstrumentId, BinaryOption>>,
         sender: &EventSender<DataEvent>,
     ) -> anyhow::Result<()> {
         let mut context = context.lock().expect("context lock is not poisoned");
-        self.commit(instrument, market, event, &mut context, sender)
+        self.commit(instrument, market, event, admission, &mut context, sender)
     }
 
     fn commit(
@@ -439,10 +457,11 @@ impl Entry {
         instrument: BinaryOption,
         market: &Market,
         event: &Event,
+        admission: MarketAdmission,
         context: &mut HashMap<InstrumentId, BinaryOption>,
         sender: &EventSender<DataEvent>,
     ) -> anyhow::Result<()> {
-        let close = parse_instrument_close(market, event, instrument.ts_init)?;
+        let close = parse_instrument_close_admitting(market, event, admission, instrument.ts_init)?;
         if let (Some(previous), Some(current)) = (self.close, close) {
             anyhow::ensure!(
                 same_close(previous, current),
@@ -540,8 +559,9 @@ fn rebuild(
     instrument: &BinaryOption,
     market: &Market,
     event: &Event,
+    admission: MarketAdmission,
 ) -> anyhow::Result<BinaryOption> {
-    let mut updated = parse_instrument(market, event, instrument.ts_init)?;
+    let mut updated = parse_instrument_admitting(market, event, admission, instrument.ts_init)?;
     if let Some(series) = instrument.info.as_ref().and_then(|info| info.get("series")) {
         let mut info = updated
             .info
@@ -649,7 +669,10 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::*;
-    use crate::http::models::PriceRange;
+    use crate::http::{
+        models::PriceRange,
+        parse::{parse_instrument, parse_instrument_close},
+    };
 
     fn source(name: &str) -> (Market, Event) {
         let value: Value =
@@ -1566,7 +1589,13 @@ mod tests {
         let (restored_market, restored_event) = metadata(&instrument).unwrap();
         assert_eq!(restored_market, market);
         assert_eq!(restored_event, event);
-        let rebuilt = rebuild(&instrument, &restored_market, &restored_event).unwrap();
+        let rebuilt = rebuild(
+            &instrument,
+            &restored_market,
+            &restored_event,
+            MarketAdmission::default(),
+        )
+        .unwrap();
         assert_eq!(rebuilt.info, instrument.info);
     }
 }
