@@ -1048,7 +1048,41 @@ explains the rounding mechanics; it does not establish `fee_cost` semantics.
   events before startup mass reconciliation. Direct applications must apply them once before
   requesting mass status.
 
-#### Lookback and history
+#### Adopting venue positions
+
+By default a nonzero venue position needs matching cached positions and orders, so a node without
+a cache database, or an account traded by another process, cannot connect
+(`KALSHI_OPENING_CONTEXT_REQUIRED`). `adopt_venue_positions=true` starts from the venue's own
+position rows instead.
+
+- **When**: Only in the pass which anchors cash: the first completed recovery pass of the client, or
+  the first after an accounting rebase. A position which appears later without this client's fills
+  is still refused.
+- **Which positions**: Every nonzero position of the subaccount and shard whose market the client
+  admits, including markets the node does not trade. A position in a market the client refuses still
+  blocks the connection.
+- **Cash**: The balance read by that pass already contains every cash effect of an adopted
+  position. The client keeps its signed net, so later fills and the settlement of that market change
+  cash by the same exact rules as for a position it opened itself.
+- **Reports**: Position reports carry `avg_px_open` from `market_exposure_dollars`: cost divided by
+  quantity for a long position, and one minus that for a short position. The average only prices a
+  position the engine opens from flat and is never compared. The engine then creates the position
+  from the report, which requires `generate_missing_orders`.
+- **History**: Mass status leaves out filled orders without cached context, with their fills, and
+  sets `reports_complete=false`. The adopted position stands in for them.
+- **Refusals**: A row which reports `netting_enabled=true`, has no cost, or has a cost of at least one
+  dollar per contract fails the connection with `KALSHI_POSITION_ADOPTION_REFUSED`.
+
+Adoption gives up what only the original fills can establish:
+
+- **Entry price**: The average is the venue cost basis of the remaining position. After partial
+  reductions it follows the venue's cost method, not this node's fill history.
+- **Realized PnL and fees**: Amounts realized before adoption are not attributed to any strategy.
+- **Traded volume**: Position notices for an adopted market skip the cumulative-volume check, which
+  would need the fills from before adoption.
+- **Ownership**: The engine attributes an adopted position to the external strategy unless a
+  strategy claims the instrument's external orders.
+
 
 - **Unbounded lookback**: The default can include historical fills without cached order context and
   fail startup.
@@ -1368,6 +1402,8 @@ The execution client also accepts:
   order events before submissions stop.
 - `mass_status_cached_instruments_only` (default `False`): Limit mass status to markets whose
   instrument is cached. See [Order and fill reports](#order-and-fill-reports).
+- `adopt_venue_positions` (default `False`): Start from venue positions which have no cached
+  opening context. See [Adopting venue positions](#adopting-venue-positions).
 
 ### Shared validation
 

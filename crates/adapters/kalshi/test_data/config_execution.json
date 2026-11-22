@@ -15,5 +15,6 @@
   "recovery_debounce_ms": 150,
   "direct_order_events": true,
   "direct_audit_timeout_secs": 45,
-  "mass_status_cached_instruments_only": true
+  "mass_status_cached_instruments_only": true,
+  "adopt_venue_positions": true
 }

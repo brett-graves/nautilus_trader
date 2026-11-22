@@ -741,6 +741,72 @@ async fn mass_report_scope_decides_whether_other_market_history_fails_it(#[case]
 }
 
 #[tokio::test]
+async fn adopting_mass_report_omits_unattributed_fills_and_prices_the_position() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let f = report_fixtures();
+        let replies = snapshot_replies(&f);
+        let (listener, address) = http::bind_peer(0).await;
+        let peer = tokio::spawn(async move {
+            rest::quota_discovery(&listener).await;
+            for body in replies {
+                rest::reply(&listener, 200, body).await;
+            }
+        });
+
+        // The cache holds the instrument but no order for the filled venue order
+        let (stock, instrument, cache) = report_client(address, false, true);
+        drop(stock);
+
+        let config = KalshiExecutionClientConfig {
+            api_key_id: Some("auth-test-id".into()),
+            private_key: Some(keys::ed25519_pkcs8().into()),
+            base_url_http: Some(format!("http://{address}/custom/v3").into()),
+            http_timeout_secs: 1,
+            exchange_index: 3,
+            adopt_venue_positions: true,
+            ..Default::default()
+        };
+
+        let core = ExecutionClientCore::new(
+            "TRADER-001".into(),
+            "TEST".into(),
+            *KALSHI_VENUE,
+            OmsType::Netting,
+            config.account_id,
+            AccountType::Cash,
+            Some(Currency::USD()),
+            Rc::clone(&cache),
+        );
+        let client = KalshiExecutionClient::new(core, config).unwrap();
+        let mass = client
+            .generate_mass_status(Some(60))
+            .await
+            .unwrap()
+            .unwrap();
+        peer.await.unwrap();
+
+        assert!(!mass.reports_complete());
+        assert_eq!(mass.order_reports().len(), 0);
+        assert_eq!(mass.fill_reports().len(), 0);
+        let position = &mass.position_reports()[&instrument.id][0];
+        assert_eq!(
+            position.signed_decimal_qty,
+            "-2.75".parse::<rust_decimal::Decimal>().unwrap()
+        );
+        assert_eq!(
+            position.avg_px_open,
+            Some(
+                rust_decimal::Decimal::ONE
+                    - "1.020002".parse::<rust_decimal::Decimal>().unwrap()
+                        / "2.75".parse::<rust_decimal::Decimal>().unwrap()
+            )
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn unbounded_mass_report_cannot_claim_complete_external_recovery() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut f = report_fixtures();

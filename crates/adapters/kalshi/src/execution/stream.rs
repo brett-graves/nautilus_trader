@@ -380,12 +380,21 @@ impl PrivateStream {
                 .definitions
                 .get(&id)
                 .context("private position definition missing")?;
-            let report = reports::position(
-                position,
-                definition,
-                self.emitter.account_id(),
-                snapshot.ts_init,
-            )?;
+            let report = if self.config.adopt_venue_positions {
+                reports::position_with_cost(
+                    position,
+                    definition,
+                    self.emitter.account_id(),
+                    snapshot.ts_init,
+                )?
+            } else {
+                reports::position(
+                    position,
+                    definition,
+                    self.emitter.account_id(),
+                    snapshot.ts_init,
+                )?
+            };
             anyhow::ensure!(
                 projected.get(&id) == Some(&report.signed_decimal_qty),
                 "private position does not yet cover fills"

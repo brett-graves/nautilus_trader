@@ -70,8 +70,8 @@ use nautilus_model::{
     accounts::AccountAny,
     data::Data,
     enums::{
-        AccountType, BookType, ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus,
-        OrderType, PositionSide, TimeInForce,
+        AccountType, AvgPxReconciliation, BookType, ContingencyType, LiquiditySide, OmsType,
+        OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
     },
     events::{
         AccountState, OrderAccepted, OrderEventAny, OrderFilled, OrderPendingCancel,
@@ -2520,6 +2520,147 @@ async fn startup_retries_cached_position_mismatch() {
         let mut engine = harness.exec_engine().borrow_mut();
         let client = engine.get_client_adapter_mut(&harness.client_id()).unwrap();
         client.disconnect().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[rstest]
+#[case::long("2.00", "1.200000", "0.6", "2.250000", "3.25")]
+#[case::short("-3.00", "1.380000", "0.54", "3.500000", "-1.75")]
+#[tokio::test]
+async fn startup_adopts_cold_venue_position_and_accounts_a_later_fill_exactly(
+    #[case] net: &str,
+    #[case] cost: &str,
+    #[case] average: &str,
+    #[case] cash_after_fill: &str,
+    #[case] net_after_fill: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(25), async {
+        let mut peer = Peer::with_timeout(None, 10).await;
+        peer.config.adopt_venue_positions = true;
+        peer.balance.lock().unwrap()["balance_dollars"] = "3.000100".into();
+        peer.submissions.ack_gate.add_permits(1);
+        peer.market.lock().unwrap()["open_time"] = "2020-01-01T00:00:00Z".into();
+        peer.market.lock().unwrap()["close_time"] = "2100-01-01T00:00:00Z".into();
+        let instrument = bootstrap_instrument();
+        let fixtures: Value =
+            serde_json::from_str(include_str!("../../test_data/rest_responses.json")).unwrap();
+        let mut position = fixtures["positions"]["market_positions"][0].clone();
+        position["ticker"] = instrument.id.symbol.as_str().into();
+        position["position_fp"] = net.into();
+        position["market_exposure_dollars"] = cost.into();
+        position["netting_enabled"] = false.into();
+        *peer.positions.lock().unwrap() =
+            json!({"market_positions": [position.clone()], "event_positions": [], "cursor": ""});
+
+        // No cached order or position: the venue row is the only opening evidence
+        let (harness, mut client, mut output, _data) =
+            bootstrap_consumer(&peer, &instrument, false);
+        client.start().unwrap();
+        let queued = connect_consuming_accounts(&mut client, &mut output).await;
+
+        let reported: Vec<_> = queued
+            .iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::Report(ExecutionReport::Position(report)) => Some(report.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!reported.is_empty());
+        let report = reported.last().unwrap();
+        assert_eq!(report.instrument_id, instrument.id);
+        assert_eq!(report.signed_decimal_qty, dec(net));
+        assert_eq!(report.avg_px_open, Some(dec(average)));
+        assert_eq!(
+            report.avg_px_open_reconciliation,
+            AvgPxReconciliation::OpeningOnly
+        );
+
+        harness.register_client(Box::new(client)).unwrap();
+        direct_wait(&mut output, || direct_connected(&harness)).await;
+        assert_eq!(native_balance(&harness).total.as_decimal(), dec("3.000100"));
+
+        // A buy of 1.25 at 0.60 changes cash by the signed-binary rule from the adopted net
+        let order = native_order(&harness, "after-adoption", OrderSide::Buy, false);
+        let id = order.client_order_id();
+        native_submit(&harness, &order, None);
+        direct_wait(&mut output, || {
+            native_status(&harness, id) == OrderStatus::Accepted
+        })
+        .await;
+        native_fill(&peer, "1.25", true);
+        peer.positions.lock().unwrap()["market_positions"][0]["position_fp"] =
+            net_after_fill.into();
+        peer.balance.lock().unwrap()["balance_dollars"] = cash_after_fill.into();
+
+        let events = direct_wait(&mut output, || {
+            native_status(&harness, id) == OrderStatus::Filled
+                && native_balance(&harness).total.as_decimal() == dec(cash_after_fill)
+                && direct_connected(&harness)
+        })
+        .await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+                .count(),
+            1
+        );
+
+        // Later passes keep agreeing with the venue net and cash
+        let reads = peer.balance_reads.load(Ordering::SeqCst);
+        direct_wait(&mut output, || {
+            peer.balance_reads.load(Ordering::SeqCst) >= reads + 4
+        })
+        .await;
+        assert!(direct_connected(&harness));
+        assert_eq!(
+            native_balance(&harness).total.as_decimal(),
+            dec(cash_after_fill)
+        );
+        native_disconnect(&harness).await;
+    })
+    .await
+    .unwrap();
+}
+
+#[rstest]
+#[case::no_cost("0.000000", None)]
+#[case::netted("1.380000", Some(true))]
+#[tokio::test]
+async fn startup_refuses_to_adopt_an_inconsistent_or_netted_venue_position(
+    #[case] cost: &str,
+    #[case] netting_enabled: Option<bool>,
+) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut peer = Peer::new(None).await;
+        peer.config.ws_timeout_secs = 10;
+        peer.config.adopt_venue_positions = true;
+        let instrument = bootstrap_instrument();
+        let fixtures: Value =
+            serde_json::from_str(include_str!("../../test_data/rest_responses.json")).unwrap();
+        let mut position = fixtures["positions"]["market_positions"][0].clone();
+        position["ticker"] = instrument.id.symbol.as_str().into();
+        position["position_fp"] = "-3.00".into();
+        position["market_exposure_dollars"] = cost.into();
+        if let Some(enabled) = netting_enabled {
+            position["netting_enabled"] = enabled.into();
+        }
+
+        *peer.positions.lock().unwrap() =
+            json!({"market_positions": [position], "event_positions": [], "cursor": ""});
+        let (_harness, mut client, _output, _data) = bootstrap_consumer(&peer, &instrument, false);
+
+        let error = tokio::time::timeout(Duration::from_secs(8), client.connect())
+            .await
+            .expect("refused adoption waited for the connection timeout")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "KALSHI_POSITION_ADOPTION_REFUSED: venue position applies netting or its cost contradicts its quantity"
+        );
+        assert!(!client.is_connected());
     })
     .await
     .unwrap();

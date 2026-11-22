@@ -94,6 +94,8 @@ class KalshiExecutionClientConfig:
     def direct_audit_timeout_secs(self) -> int: ...
     @property
     def mass_status_cached_instruments_only(self) -> bool: ...
+    @property
+    def adopt_venue_positions(self) -> bool: ...
     def __init__(
         self,
         account_id: model.AccountId | None = None,
@@ -114,6 +116,7 @@ class KalshiExecutionClientConfig:
         direct_order_events: bool | None = None,
         direct_audit_timeout_secs: int | None = None,
         mass_status_cached_instruments_only: bool | None = None,
+        adopt_venue_positions: bool | None = None,
     ) -> None: ...
     @property
     def has_credentials(self) -> bool: ...

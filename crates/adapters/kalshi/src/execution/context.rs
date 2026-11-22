@@ -82,6 +82,9 @@ pub struct PrivateState {
     pub(super) notices_positions: HashMap<InstrumentId, PositionNotice>,
     direct_fills: HashMap<TradeId, DirectFill>,
     direct_cancels: HashMap<ClientOrderId, DirectCancel>,
+    /// Whether the first recovery pass adopts venue positions which lack cached opening context.
+    pub(super) adopt_positions: bool,
+    adopted: HashSet<InstrumentId>,
 }
 
 #[allow(
@@ -119,6 +122,8 @@ impl PrivateState {
             notices_positions: HashMap::new(),
             direct_fills: HashMap::new(),
             direct_cancels: HashMap::new(),
+            adopt_positions: false,
+            adopted: HashSet::new(),
         }
     }
 
@@ -1242,6 +1247,11 @@ impl PrivateState {
                     });
             }
 
+            // An adopted position has traded volume from before this client's order history
+            if self.adopted.contains(id) {
+                continue;
+            }
+
             let volume = orders
                 .values()
                 .filter(|order| order.instrument_id() == *id)
@@ -1922,7 +1932,7 @@ impl PrivateState {
     }
 
     pub(super) fn openings(
-        &self,
+        &mut self,
         plans: &[OrderPlan],
         positions: &[MarketPosition],
         settlements: &[Settlement],
@@ -1946,6 +1956,12 @@ impl PrivateState {
         for position in positions {
             let id = crate::common::parse::parse_instrument_id(&position.ticker)?;
             let delta = deltas.remove(&id).unwrap_or(Decimal::ZERO);
+
+            if let Some(opening) = self.adopt(id, position, delta)? {
+                openings.insert(id, opening);
+                continue;
+            }
+
             openings.insert(id, self.opening(id, position.position_fp.0, delta)?);
         }
 
@@ -1964,6 +1980,58 @@ impl PrivateState {
 
         anyhow::ensure!(deltas.is_empty(), "fills lack explicit position coverage");
         Ok(openings)
+    }
+
+    /// Adopts a venue position without cached opening context as the opening state.
+    ///
+    /// Adoption happens only while the cash anchor is unknown, which is the first completed pass
+    /// of this client or the first after an accounting rebase. The venue balance read by that
+    /// pass already contains every cash effect of the adopted position, so the signed net is all
+    /// the cash model needs from it. A position which appears later is not adopted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the venue row applies netting or its cost contradicts its quantity.
+    fn adopt(
+        &mut self,
+        id: InstrumentId,
+        position: &MarketPosition,
+        delta: Decimal,
+    ) -> anyhow::Result<Option<Decimal>> {
+        if !self.adopt_positions
+            || !self.ledger.total_is_unknown()
+            || self.positions.contains_key(&id)
+        {
+            return Ok(None);
+        }
+
+        let opening = position
+            .position_fp
+            .0
+            .checked_sub(delta)
+            .context("initial position overflow")?;
+
+        if opening.is_zero() {
+            return Ok(None);
+        }
+
+        if let Err(e) = reports::cost_average(position) {
+            log::error!(
+                "Kalshi cannot adopt the venue position in {}: {e}",
+                position.ticker
+            );
+            return Err(RecoveryContextError::Adoption.into());
+        }
+
+        if self.adopted.insert(id) {
+            log::info!(
+                "Kalshi adopts the venue position in {} as opening state, net={opening}, cost={}",
+                position.ticker,
+                position.market_exposure_dollars.0
+            );
+        }
+
+        Ok(Some(opening))
     }
 
     fn opening(&self, id: InstrumentId, net: Decimal, delta: Decimal) -> anyhow::Result<Decimal> {
@@ -2444,6 +2512,10 @@ pub(super) enum RecoveryContextError {
         "KALSHI_OPENING_CONTEXT_REQUIRED: position cycle lacks cached opening authority; restore complete cached orders and positions"
     )]
     Position,
+    #[error(
+        "KALSHI_POSITION_ADOPTION_REFUSED: venue position applies netting or its cost contradicts its quantity"
+    )]
+    Adoption,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5584,6 +5656,110 @@ mod tests {
                 .is_err()
         );
         assert!(state.barrier.lock().unwrap().is_blocked());
+    }
+
+    fn venue_position(instrument: &BinaryOption, signed: &str, cost: &str) -> MarketPosition {
+        let f: Value =
+            serde_json::from_str(include_str!("../../test_data/rest_responses.json")).unwrap();
+        let mut position: MarketPosition =
+            serde_json::from_value(f["positions"]["market_positions"][0].clone()).unwrap();
+        position.ticker = instrument.id.symbol.to_string();
+        position.position_fp = FixedPoint(signed.parse().unwrap());
+        position.market_exposure_dollars = FixedPoint(cost.parse().unwrap());
+        position
+    }
+
+    #[rstest]
+    #[case::long("2.00", "1.200000")]
+    #[case::short("-3.00", "1.380000")]
+    fn first_pass_adopts_a_venue_position_only_when_enabled(
+        #[case] signed: &str,
+        #[case] cost: &str,
+    ) {
+        let instrument = instrument();
+        let position = venue_position(&instrument, signed, cost);
+        let net: Decimal = signed.parse().unwrap();
+
+        let mut stock = PrivateState::new();
+        assert!(matches!(
+            stock
+                .openings(&[], std::slice::from_ref(&position), &[])
+                .unwrap_err()
+                .downcast_ref::<RecoveryContextError>(),
+            Some(RecoveryContextError::Position)
+        ));
+
+        let mut state = PrivateState::new();
+        state.adopt_positions = true;
+        let openings = state
+            .openings(&[], std::slice::from_ref(&position), &[])
+            .unwrap();
+        assert_eq!(openings[&instrument.id], net);
+
+        // The pass which adopted the position anchors cash and makes the net authoritative
+        state.positions = openings;
+        let ticket = state.ledger.begin_refresh();
+        state
+            .ledger
+            .apply_refresh(ticket, Decimal::from(3), HashMap::new())
+            .unwrap();
+        assert_eq!(
+            state
+                .openings(&[], std::slice::from_ref(&position), &[])
+                .unwrap()[&instrument.id],
+            net
+        );
+
+        // A later venue net which this client's fills do not explain is still refused
+        let moved = venue_position(&instrument, "5.00", "2.500000");
+        assert!(state.openings(&[], &[moved], &[]).is_err());
+    }
+
+    #[rstest]
+    fn position_appearing_after_the_cash_anchor_is_not_adopted() {
+        let instrument = instrument();
+        let position = venue_position(&instrument, "-3.00", "1.380000");
+        let mut state = PrivateState::new();
+        state.adopt_positions = true;
+        let ticket = state.ledger.begin_refresh();
+        state
+            .ledger
+            .apply_refresh(ticket, Decimal::from(3), HashMap::new())
+            .unwrap();
+
+        assert!(matches!(
+            state
+                .openings(&[], &[position], &[])
+                .unwrap_err()
+                .downcast_ref::<RecoveryContextError>(),
+            Some(RecoveryContextError::Position)
+        ));
+    }
+
+    #[rstest]
+    #[case::no_cost("-3.00", "0.000000", Field::Missing)]
+    #[case::cost_above_quantity("2.00", "2.500000", Field::Missing)]
+    #[case::netting("-3.00", "1.380000", Field::Value(true))]
+    fn inconsistent_or_netted_venue_position_refuses_adoption(
+        #[case] signed: &str,
+        #[case] cost: &str,
+        #[case] netting_enabled: Field<bool>,
+    ) {
+        let instrument = instrument();
+        let mut position = venue_position(&instrument, signed, cost);
+        position.netting_enabled = netting_enabled;
+        let mut state = PrivateState::new();
+        state.adopt_positions = true;
+
+        let error = state.openings(&[], &[position], &[]).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<RecoveryContextError>(),
+            Some(RecoveryContextError::Adoption)
+        ));
+        assert_eq!(
+            error.to_string(),
+            "KALSHI_POSITION_ADOPTION_REFUSED: venue position applies netting or its cost contradicts its quantity"
+        );
     }
 
     #[rstest]

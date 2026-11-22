@@ -271,6 +271,10 @@ pub struct KalshiExecutionClientConfig {
     /// records of other markets were left out.
     #[builder(default)]
     pub mass_status_cached_instruments_only: bool,
+    /// Takes a venue position without cached opening context as the opening state of the first
+    /// recovery pass, and reports its average entry price from the venue cost basis.
+    #[builder(default)]
+    pub adopt_venue_positions: bool,
 }
 
 #[cfg(feature = "python")]
@@ -288,6 +292,7 @@ nautilus_core::impl_pyo3_config_getters!(KalshiExecutionClientConfig {
     direct_order_events: bool,
     direct_audit_timeout_secs: u64,
     mass_status_cached_instruments_only: bool,
+    adopt_venue_positions: bool,
 });
 
 impl Default for KalshiExecutionClientConfig {
@@ -650,6 +655,7 @@ mod tests {
                 direct_order_events: false,
                 direct_audit_timeout_secs: 30,
                 mass_status_cached_instruments_only: false,
+                adopt_venue_positions: false,
             }
         );
         assert!(!data.has_credentials());
@@ -756,6 +762,7 @@ mod tests {
             .direct_order_events(true)
             .direct_audit_timeout_secs(45)
             .mass_status_cached_instruments_only(true)
+            .adopt_venue_positions(true)
             .transport_backend(TransportBackend::Sockudo)
             .build();
         let round_trip_data: KalshiDataClientConfig =

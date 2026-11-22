@@ -98,7 +98,10 @@ use crate::{
     config::{KalshiDataClientConfig, KalshiExecutionClientConfig},
     http::{
         client::KalshiHttpClient,
-        models::{Fill, HistoricalCutoff, Order as VenueOrder, OrderStatus as VenueOrderStatus},
+        models::{
+            Fill, HistoricalCutoff, MarketPosition, Order as VenueOrder,
+            OrderStatus as VenueOrderStatus,
+        },
         query::FillsQuery,
     },
     websocket::{
@@ -185,6 +188,9 @@ impl KalshiExecutionClient {
         }
 
         core.set_disconnected();
+        let mut private = PrivateState::new();
+        private.adopt_positions = config.adopt_venue_positions;
+
         Ok(Self {
             core,
             clock,
@@ -194,7 +200,7 @@ impl KalshiExecutionClient {
             definitions: RefCell::new(HashMap::new()),
             transport,
             disposed: false,
-            private: Arc::new(Mutex::new(PrivateState::new())),
+            private: Arc::new(Mutex::new(private)),
             ready: Arc::new(AtomicBool::new(false)),
             session_tasks: TaskGroup::new(),
             command_tasks: TaskGroup::new(),
@@ -1322,7 +1328,7 @@ impl ExecutionClient for KalshiExecutionClient {
             }
 
             let definition = self.definition(&value.ticker, ts_init).await?;
-            let report = reports::position(value, &definition, self.core.account_id, ts_init)?;
+            let report = self.position_report(value, &definition, ts_init)?;
             if cmd.start.is_none_or(|start| report.ts_last >= start)
                 && cmd.end.is_none_or(|end| report.ts_last <= end)
             {
@@ -1349,6 +1355,27 @@ impl ExecutionClient for KalshiExecutionClient {
 }
 
 impl KalshiExecutionClient {
+    fn position_report(
+        &self,
+        value: &MarketPosition,
+        definition: &BinaryOption,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<PositionStatusReport> {
+        if self.config.adopt_venue_positions {
+            reports::position_with_cost(value, definition, self.core.account_id, ts_init)
+        } else {
+            reports::position(value, definition, self.core.account_id, ts_init)
+        }
+    }
+
+    /// Returns whether a filled venue order has no cached order to attribute its fills to.
+    fn lacks_fill_context(&self, value: &VenueOrder) -> anyhow::Result<bool> {
+        let venue_order_id = VenueOrderId::new_checked(&value.order_id)?;
+        Ok(!value.fill_count_fp.0.is_zero()
+            && self.cached_order(value)?.is_none()
+            && self.core.cache().client_order_id(&venue_order_id).is_none())
+    }
+
     /// Returns whether mass status reports records of this market.
     fn in_mass_status_scope(&self, ticker: &str) -> bool {
         !self.config.mass_status_cached_instruments_only
@@ -1377,10 +1404,17 @@ impl KalshiExecutionClient {
         let mut orders = Vec::new();
         let mut omitted = 0;
         let mut unscoped = 0;
+        let mut unattributed = HashSet::new();
 
         for value in &snapshot.orders {
             if !self.in_mass_status_scope(&value.ticker) {
                 unscoped += 1;
+                continue;
+            }
+
+            // Adopted positions stand in for the fills of orders this node never knew
+            if self.config.adopt_venue_positions && self.lacks_fill_context(value)? {
+                unattributed.insert(value.order_id.as_str());
                 continue;
             }
 
@@ -1411,6 +1445,10 @@ impl KalshiExecutionClient {
                 continue;
             }
 
+            if unattributed.contains(value.order_id.as_str()) {
+                continue;
+            }
+
             let source = source_orders
                 .get(value.order_id.as_str())
                 .context("fill lacks order evidence")?;
@@ -1419,10 +1457,10 @@ impl KalshiExecutionClient {
         }
 
         validate_fill_coverage(
-            snapshot
-                .orders
-                .iter()
-                .filter(|order| self.in_mass_status_scope(&order.ticker)),
+            snapshot.orders.iter().filter(|order| {
+                self.in_mass_status_scope(&order.ticker)
+                    && !unattributed.contains(order.order_id.as_str())
+            }),
             &fills,
             start,
             Some(snapshot.ts_init),
@@ -1437,8 +1475,7 @@ impl KalshiExecutionClient {
             }
 
             let definition = self.definition(&value.ticker, snapshot.ts_init).await?;
-            let report =
-                reports::position(value, &definition, self.core.account_id, snapshot.ts_init)?;
+            let report = self.position_report(value, &definition, snapshot.ts_init)?;
             anyhow::ensure!(
                 report.ts_last <= snapshot.ts_init,
                 "position changed after mass collection began"
@@ -1468,7 +1505,17 @@ impl KalshiExecutionClient {
             );
         }
 
-        mass.set_report_window(start, omitted == 0 && unscoped == 0);
+        if !unattributed.is_empty() {
+            log::warn!(
+                "Kalshi mass status omits {} filled order(s) without cached context, reports are incomplete",
+                unattributed.len()
+            );
+        }
+
+        mass.set_report_window(
+            start,
+            omitted == 0 && unscoped == 0 && unattributed.is_empty(),
+        );
         mass.add_order_reports(orders);
         mass.add_fill_reports(fills);
         mass.add_position_reports(positions);

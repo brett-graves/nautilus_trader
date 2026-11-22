@@ -16,7 +16,10 @@
 use anyhow::Context;
 use nautilus_core::{UnixNanos, datetime::try_datetime_to_unix_nanos};
 use nautilus_model::{
-    enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce},
+    enums::{
+        AvgPxReconciliation, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide,
+        TimeInForce,
+    },
     events::OrderEventAny,
     identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
     instruments::BinaryOption,
@@ -360,6 +363,69 @@ pub(super) fn position(
     Ok(report)
 }
 
+/// Returns the average YES entry price which a venue position row's cost basis implies.
+///
+/// Kalshi reports the cost of the remaining position: the YES prices paid for a long position
+/// and one minus the YES prices sold for a short position. A flat row has no average.
+///
+/// # Errors
+///
+/// Returns an error if the row applies netting or its cost cannot belong to its quantity.
+pub(super) fn cost_average(value: &MarketPosition) -> anyhow::Result<Option<Decimal>> {
+    let signed = value.position_fp.0;
+
+    if signed.is_zero() {
+        return Ok(None);
+    }
+
+    let contracts = signed.abs();
+    let cost = value.market_exposure_dollars.0;
+    anyhow::ensure!(
+        value.netting_enabled != Field::Value(true),
+        "venue position applies collateral-return netting"
+    );
+    anyhow::ensure!(
+        signed.normalize().scale() <= 2
+            && cost > Decimal::ZERO
+            && cost < contracts
+            && value.fees_paid_dollars.0 >= Decimal::ZERO,
+        "venue position cost is inconsistent with its quantity"
+    );
+    let average = cost
+        .checked_div(contracts)
+        .context("venue position cost average overflow")?;
+
+    Ok(Some(if signed > Decimal::ZERO {
+        average
+    } else {
+        Decimal::ONE - average
+    }))
+}
+
+/// Builds a position report which also carries the venue cost average as its entry price.
+///
+/// The average only prices a position which the engine opens from flat. It is never compared
+/// with a cached average, because the venue cost basis is not this node's fill history.
+///
+/// # Errors
+///
+/// Returns an error if [`position`] would.
+pub(super) fn position_with_cost(
+    value: &MarketPosition,
+    instrument: &BinaryOption,
+    account_id: AccountId,
+    ts_init: UnixNanos,
+) -> anyhow::Result<PositionStatusReport> {
+    let mut report = position(value, instrument, account_id, ts_init)?;
+
+    if let Ok(Some(average)) = cost_average(value) {
+        report.avg_px_open = Some(average);
+        report.avg_px_open_reconciliation = AvgPxReconciliation::OpeningOnly;
+    }
+
+    Ok(report)
+}
+
 pub(super) fn quantity(value: FixedPoint, precision: u8) -> anyhow::Result<Quantity> {
     anyhow::ensure!(
         value.0 >= Decimal::ZERO,
@@ -413,6 +479,85 @@ mod tests {
         models::{Event, Market},
         parse::parse_instrument,
     };
+
+    #[rstest]
+    #[case::long("2.00", "1.200000", Some("0.6"))]
+    #[case::short("-8.00", "3.670000", Some("0.54125"))]
+    #[case::flat("0.00", "0.000000", None)]
+    fn venue_cost_basis_implies_the_average_yes_entry_price(
+        #[case] signed: &str,
+        #[case] cost: &str,
+        #[case] average: Option<&str>,
+    ) {
+        let instrument = instrument();
+        let mut value: MarketPosition =
+            serde_json::from_value(fixture("positions")["market_positions"][0].clone()).unwrap();
+        value.ticker = instrument.id.symbol.to_string();
+        value.position_fp = FixedPoint(signed.parse().unwrap());
+        value.market_exposure_dollars = FixedPoint(cost.parse().unwrap());
+        let average = average.map(|value| value.parse::<Decimal>().unwrap());
+        assert_eq!(cost_average(&value).unwrap(), average);
+
+        let report = position_with_cost(
+            &value,
+            &instrument,
+            AccountId::from("KALSHI-007"),
+            UnixNanos::from(543),
+        )
+        .unwrap();
+        assert_eq!(report.avg_px_open, average);
+        assert_eq!(
+            report.signed_decimal_qty,
+            signed.parse::<Decimal>().unwrap()
+        );
+
+        if average.is_some() {
+            assert_eq!(
+                report.avg_px_open_reconciliation,
+                AvgPxReconciliation::OpeningOnly
+            );
+        }
+
+        let plain = position(
+            &value,
+            &instrument,
+            AccountId::from("KALSHI-007"),
+            UnixNanos::from(543),
+        )
+        .unwrap();
+        assert_eq!(plain.avg_px_open, None);
+    }
+
+    #[rstest]
+    #[case::no_cost("-3.00", "0.000000", Field::Missing)]
+    #[case::cost_of_every_contract("-3.00", "3.000000", Field::Missing)]
+    #[case::cost_above_quantity("2.00", "2.500000", Field::Value(false))]
+    #[case::negative_cost("2.00", "-0.100000", Field::Missing)]
+    #[case::netting("-3.00", "1.380000", Field::Value(true))]
+    fn inconsistent_or_netted_cost_basis_has_no_average(
+        #[case] signed: &str,
+        #[case] cost: &str,
+        #[case] netting_enabled: Field<bool>,
+    ) {
+        let instrument = instrument();
+        let mut value: MarketPosition =
+            serde_json::from_value(fixture("positions")["market_positions"][0].clone()).unwrap();
+        value.ticker = instrument.id.symbol.to_string();
+        value.position_fp = FixedPoint(signed.parse().unwrap());
+        value.market_exposure_dollars = FixedPoint(cost.parse().unwrap());
+        value.netting_enabled = netting_enabled;
+        assert!(cost_average(&value).is_err());
+
+        // A report still describes the position; only adoption requires a consistent cost
+        let report = position_with_cost(
+            &value,
+            &instrument,
+            AccountId::from("KALSHI-007"),
+            UnixNanos::from(543),
+        )
+        .unwrap();
+        assert_eq!(report.avg_px_open, None);
+    }
 
     #[rstest]
     #[case("0.00", PositionSide::Flat)]

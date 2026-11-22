@@ -115,7 +115,7 @@ impl KalshiDataClientConfig {
 impl KalshiExecutionClientConfig {
     /// Configuration for the Kalshi execution client.
     #[new]
-    #[pyo3(signature = (account_id = None, api_key_id = None, private_key = None, environment = None, base_url_http = None, base_url_ws = None, proxy_url = None, http_timeout_secs = None, ws_timeout_secs = None, exchange_index = None, transport_backend = None, subaccount = None, admit_collateral_netting = None, recovery_idle_interval_secs = None, recovery_debounce_ms = None, direct_order_events = None, direct_audit_timeout_secs = None, mass_status_cached_instruments_only = None))]
+    #[pyo3(signature = (account_id = None, api_key_id = None, private_key = None, environment = None, base_url_http = None, base_url_ws = None, proxy_url = None, http_timeout_secs = None, ws_timeout_secs = None, exchange_index = None, transport_backend = None, subaccount = None, admit_collateral_netting = None, recovery_idle_interval_secs = None, recovery_debounce_ms = None, direct_order_events = None, direct_audit_timeout_secs = None, mass_status_cached_instruments_only = None, adopt_venue_positions = None))]
     #[expect(
         clippy::too_many_arguments,
         reason = "thin projection of the Rust config fields"
@@ -139,6 +139,7 @@ impl KalshiExecutionClientConfig {
         direct_order_events: Option<bool>,
         direct_audit_timeout_secs: Option<u64>,
         mass_status_cached_instruments_only: Option<bool>,
+        adopt_venue_positions: Option<bool>,
     ) -> PyResult<Self> {
         let defaults = Self::default();
 
@@ -165,6 +166,7 @@ impl KalshiExecutionClientConfig {
                 .unwrap_or(defaults.direct_audit_timeout_secs),
             mass_status_cached_instruments_only: mass_status_cached_instruments_only
                 .unwrap_or(defaults.mass_status_cached_instruments_only),
+            adopt_venue_positions: adopt_venue_positions.unwrap_or(defaults.adopt_venue_positions),
         };
 
         config.validate().map_err(config_error_to_pyvalue_err)?;
@@ -258,6 +260,7 @@ mod tests {
                 kwargs
                     .set_item("mass_status_cached_instruments_only", true)
                     .unwrap();
+                kwargs.set_item("adopt_venue_positions", true).unwrap();
             }
 
             let config = class.call((), Some(&kwargs)).unwrap();
@@ -307,6 +310,7 @@ mod tests {
                     direct_order_events: true,
                     direct_audit_timeout_secs: 45,
                     mass_status_cached_instruments_only: true,
+                    adopt_venue_positions: true,
                 };
 
                 assert_eq!(actual, expected);
