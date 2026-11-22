@@ -60,7 +60,7 @@ use crate::{
     book::{BookSyncTracker, Levels},
     common::{consts::KALSHI_VENUE, parse::parse_ticker},
     config::KalshiDataClientConfig,
-    http::client::KalshiHttpClient,
+    http::{client::KalshiHttpClient, parse::MarketRefusal},
     providers::{KalshiInstrumentProvider, request_bounds},
     websocket::{
         client::{KalshiWebSocketClient, KalshiWsEvent},
@@ -392,7 +392,7 @@ impl DataClient for KalshiDataClient {
             .lock()
             .expect("context lock is not poisoned")
             .clear();
-        refresh(
+        let bootstrap = refresh(
             &self.provider,
             &self.instruments,
             &self.context,
@@ -400,7 +400,17 @@ impl DataClient for KalshiDataClient {
             &self.sender,
             &self.session_tasks.cancellation_token(),
         )
-        .await?;
+        .await;
+
+        if let Err(e) = bootstrap {
+            // The engine withholds provider error text; a refusal carries no credentials
+            if let Some(refusal) = e.downcast_ref::<MarketRefusal>() {
+                log::error!("Kalshi bootstrap market refused: {refusal}");
+            }
+
+            return Err(e);
+        }
+
         let (ws_client, receiver) = KalshiWebSocketClient::new(self.config.clone())?;
         ws_client.subscribe(KalshiSubscription {
             channel: KalshiChannel::MarketLifecycleV2,

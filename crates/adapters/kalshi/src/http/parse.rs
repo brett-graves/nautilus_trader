@@ -159,6 +159,38 @@ impl Pagination {
     }
 }
 
+/// The first admission rule a market fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MarketRefusalReason {
+    #[error("market type is not binary")]
+    MarketType,
+    #[error("contract notional is not USD 1")]
+    Notional,
+    #[error("settlement bounds are not default")]
+    SettlementBounds,
+    #[error("event uses MECNET or DIRECNET collateral-return netting")]
+    CollateralNetting,
+    #[error("event collateral-return type is unknown")]
+    UnknownCollateral,
+    #[error("settlement floor is nonzero")]
+    SettlementFloor,
+    #[error("market belongs to a multivariate collection")]
+    Multivariate,
+}
+
+/// A market refused by admission.
+///
+/// The message carries only the public ticker and a static reason, so callers can log it where
+/// provider error text is otherwise withheld.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported market economics or family for {ticker}: {reason}")]
+pub struct MarketRefusal {
+    /// Native ticker of the refused market.
+    pub ticker: String,
+    /// The first admission rule the market fails.
+    pub reason: MarketRefusalReason,
+}
+
 /// Maps an admitted ordinary market to the canonical YES-priced instrument.
 ///
 /// The retained market and event metadata restore grid and shard context on restart.
@@ -166,15 +198,13 @@ impl Pagination {
 /// # Errors
 ///
 /// Returns an error if economics are unsupported, identity or shard is inconsistent, or metadata is invalid.
+/// Unsupported economics return a [`MarketRefusal`].
 pub fn parse_instrument(
     market: &Market,
     event: &Event,
     ts_init: UnixNanos,
 ) -> anyhow::Result<BinaryOption> {
-    anyhow::ensure!(
-        supported_market(market, event),
-        "unsupported market economics or family"
-    );
+    check_admission(market, event)?;
     anyhow::ensure!(
         market.event_ticker == event.event_ticker,
         "market and event identity mismatch"
@@ -248,14 +278,36 @@ pub fn parse_instrument(
     Ok(instrument)
 }
 
-pub(crate) fn supported_market(market: &Market, event: &Event) -> bool {
-    market.market_type == MarketType::Binary
-        && market.notional_value_dollars.0 == Decimal::ONE
-        && market.settlement_bounds_type == SettlementBoundsType::Default
-        && event.collateral_return_type == CollateralReturnType::None
-        && !matches!(&market.settlement_floor_dollars, Field::Value(v) if v.0 != Decimal::ZERO)
-        && !matches!(&market.mve_collection_ticker, Field::Value(v) if !v.is_empty())
-        && !matches!(&market.mve_selected_legs, Field::Value(v) if !v.is_empty())
+/// Checks the admission rules in a fixed order and reports the first failure.
+///
+/// # Errors
+///
+/// Returns an error if the market fails an admission rule; the [`MarketRefusal`] names both.
+pub fn check_admission(market: &Market, event: &Event) -> Result<(), MarketRefusal> {
+    let reason = if market.market_type != MarketType::Binary {
+        MarketRefusalReason::MarketType
+    } else if market.notional_value_dollars.0 != Decimal::ONE {
+        MarketRefusalReason::Notional
+    } else if market.settlement_bounds_type != SettlementBoundsType::Default {
+        MarketRefusalReason::SettlementBounds
+    } else if matches!(event.collateral_return_type, CollateralReturnType::Other(_)) {
+        MarketRefusalReason::UnknownCollateral
+    } else if event.collateral_return_type != CollateralReturnType::None {
+        MarketRefusalReason::CollateralNetting
+    } else if matches!(&market.settlement_floor_dollars, Field::Value(v) if v.0 != Decimal::ZERO) {
+        MarketRefusalReason::SettlementFloor
+    } else if matches!(&market.mve_collection_ticker, Field::Value(v) if !v.is_empty())
+        || matches!(&market.mve_selected_legs, Field::Value(v) if !v.is_empty())
+    {
+        MarketRefusalReason::Multivariate
+    } else {
+        return Ok(());
+    };
+
+    Err(MarketRefusal {
+        ticker: market.ticker.clone(),
+        reason,
+    })
 }
 
 /// Returns authoritative final YES payout evidence for an admitted ordinary binary market.

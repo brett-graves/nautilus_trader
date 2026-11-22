@@ -35,6 +35,7 @@ use nautilus_kalshi::{
         parse::parse_instrument_id,
     },
     data::KalshiDataClient,
+    http::parse::{MarketRefusal, MarketRefusalReason},
 };
 use nautilus_live::book::conformance::BookStreamChecker;
 use nautilus_model::{
@@ -349,7 +350,11 @@ async fn failed_bootstrap_canceled_connect_and_idle_closed_consumer_release_sess
         let id = ids()[0];
         let mut client = KalshiDataClient::new(*KALSHI_CLIENT_ID, peer.config.clone(), vec![id], sender.into()).unwrap();
         peer.revision.store(99, Ordering::SeqCst);
-        assert!(client.connect().await.is_err());
+        let error = client.connect().await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<MarketRefusal>().map(|refusal| refusal.reason),
+            Some(MarketRefusalReason::CollateralNetting)
+        );
         assert!(client.is_disconnected());
         assert!(peer.commands.try_recv().is_err());
         peer.revision.store(0, Ordering::SeqCst);

@@ -46,7 +46,7 @@ use crate::{
         client::KalshiHttpClient,
         error::KalshiHttpError,
         models::{Event, Field, Market, Series},
-        parse::{parse_instrument, supported_market},
+        parse::{check_admission, parse_instrument},
         query::{EventQuery, HistoricalMarketsQuery, MarketsQuery},
     },
 };
@@ -230,7 +230,12 @@ impl KalshiInstrumentProvider {
             }
 
             let event = &events[&market.event_ticker];
-            if !selection.matches(&market, event) || !supported_market(&market, event) {
+            if !selection.matches(&market, event) {
+                continue;
+            }
+
+            if let Err(refusal) = check_admission(&market, event) {
+                log::debug!("Kalshi instrument discovery skipped a market: {refusal}");
                 continue;
             }
 

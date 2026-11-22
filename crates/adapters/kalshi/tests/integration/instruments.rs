@@ -31,7 +31,7 @@ use nautilus_kalshi::{
     http::{
         client::KalshiHttpClient,
         models::{Event, Field, FixedPoint, Market, PriceRange},
-        parse::{parse_instrument, parse_instrument_close},
+        parse::{MarketRefusal, MarketRefusalReason, parse_instrument, parse_instrument_close},
     },
     providers::KalshiInstrumentProvider,
 };
@@ -92,8 +92,12 @@ fn captured_decimal_strike_ticker_roundtrips() {
     assert_eq!(
         parse_instrument(&market, &event, UnixNanos::from(1))
             .unwrap_err()
-            .to_string(),
-        "unsupported market economics or family"
+            .downcast::<MarketRefusal>()
+            .unwrap(),
+        MarketRefusal {
+            ticker: "KXBTCD-26OCT1717-T91749.99".into(),
+            reason: MarketRefusalReason::CollateralNetting,
+        }
     );
 }
 
@@ -269,19 +273,22 @@ fn grid_changes_keep_storage_precision_and_old_response_prices() {
 }
 
 #[rstest]
-#[case("scalar")]
-#[case("notional")]
-#[case("floor")]
-#[case("bounds")]
-#[case("netting")]
-#[case("unknown_netting")]
-#[case("mve_collection")]
-#[case("mve_legs")]
-#[case("event_mismatch")]
-#[case("shard_mismatch")]
-#[case("missing_shard")]
-#[case("bad_ticker")]
-fn unsupported_and_inconsistent_metadata_is_rejected(#[case] mutation: &str) {
+#[case("scalar", Some(MarketRefusalReason::MarketType))]
+#[case("notional", Some(MarketRefusalReason::Notional))]
+#[case("floor", Some(MarketRefusalReason::SettlementFloor))]
+#[case("bounds", Some(MarketRefusalReason::SettlementBounds))]
+#[case("netting", Some(MarketRefusalReason::CollateralNetting))]
+#[case("unknown_netting", Some(MarketRefusalReason::UnknownCollateral))]
+#[case("mve_collection", Some(MarketRefusalReason::Multivariate))]
+#[case("mve_legs", Some(MarketRefusalReason::Multivariate))]
+#[case("event_mismatch", None)]
+#[case("shard_mismatch", None)]
+#[case("missing_shard", None)]
+#[case("bad_ticker", None)]
+fn unsupported_and_inconsistent_metadata_is_rejected(
+    #[case] mutation: &str,
+    #[case] refusal: Option<MarketRefusalReason>,
+) {
     let mut value = fixtures()["definitions"]["live"].clone();
     match mutation {
         "scalar" => value["market"]["market_type"] = "scalar".into(),
@@ -306,17 +313,25 @@ fn unsupported_and_inconsistent_metadata_is_rejected(#[case] mutation: &str) {
 
     let market: Market = serde_json::from_value(value["market"].clone()).unwrap();
     let event: Event = serde_json::from_value(value["event"].clone()).unwrap();
-    assert!(parse_instrument(&market, &event, UnixNanos::from(1)).is_err());
+    let error = parse_instrument(&market, &event, UnixNanos::from(1)).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<MarketRefusal>()
+            .map(|refusal| refusal.reason),
+        refusal
+    );
 }
 
 #[rstest]
 fn captured_netting_event_is_rejected() {
     let (market, event) = definition("unsupported");
+    assert_eq!(event.collateral_return_type.as_ref(), "MECNET");
     assert_eq!(
         parse_instrument(&market, &event, UnixNanos::from(1))
             .unwrap_err()
             .to_string(),
-        "unsupported market economics or family"
+        "unsupported market economics or family for KXESOCCERGAME-26OCT170222MORDSTRU-TIE: \
+         event uses MECNET or DIRECNET collateral-return netting"
     );
 }
 

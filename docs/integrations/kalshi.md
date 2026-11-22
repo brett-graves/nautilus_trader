@@ -155,6 +155,9 @@ The instrument provider accepts only markets with:
 - **Rejected economics**: The provider rejects unknown product or collateral behavior, `MECNET`,
   `DIRECNET`, scalar payouts, and nonzero settlement floors.
 - **Netting test**: `mutually_exclusive=false` does not prove that an event has no netting.
+- **Refusal reasons**: A refused bootstrap market fails the data connection, and the adapter logs
+  the ticker with the first failed rule. Instrument discovery skips refused markets and logs them at
+  `DEBUG`. Explicit instrument requests log the same reason with the failed request.
 - **Settlement floors**: A missing, null, or zero `settlement_floor_dollars` does not exclude an
   ordinary contract.
 - **Payouts**: Admission does not guarantee a USD 0 or USD 1 payout. Contract-specific rules can
