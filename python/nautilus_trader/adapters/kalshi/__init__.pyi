@@ -84,6 +84,10 @@ class KalshiExecutionClientConfig:
     def transport_backend(self) -> network.TransportBackend: ...
     @property
     def admit_collateral_netting(self) -> bool: ...
+    @property
+    def recovery_idle_interval_secs(self) -> int: ...
+    @property
+    def recovery_debounce_ms(self) -> int: ...
     def __init__(
         self,
         account_id: model.AccountId | None = None,
@@ -99,6 +103,8 @@ class KalshiExecutionClientConfig:
         transport_backend: network.TransportBackend | None = None,
         subaccount: int | None = None,
         admit_collateral_netting: bool | None = None,
+        recovery_idle_interval_secs: int | None = None,
+        recovery_debounce_ms: int | None = None,
     ) -> None: ...
     @property
     def has_credentials(self) -> bool: ...

@@ -82,35 +82,37 @@ impl PrivateStream {
         let mut startup = Some(startup);
         let mut interval = time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let idle = Duration::from_secs(self.config.recovery_idle_interval_secs);
+        let debounce = Duration::from_millis(self.config.recovery_debounce_ms);
+        let mut verified: Option<time::Instant> = None;
 
         loop {
             let recover = tokio::select! {
                 biased;
                 () = cancellation.cancelled() => break,
                 event = receiver.recv() => match event {
-                    Some(KalshiWsEvent::Ready { .. }) => {
-                        self.ready.store(false, Ordering::Release);
-                        self.state.lock().expect("private state lock is not poisoned").invalidate();
-                        true
-                    }
-                    Some(KalshiWsEvent::Error { message, .. }) => {
-                        self.ready.store(false, Ordering::Release);
-                        self.state.lock().expect("private state lock is not poisoned").invalidate();
-                        log::warn!("Kalshi private stream requires recovery: {message}");
-                        false
-                    }
-                    Some(KalshiWsEvent::Message { message, .. }) => {
-                        self.notice(&message)
-                    },
-                    Some(_) => false,
+                    Some(event) => self.observe(event),
                     None => break,
                 },
                 request = requests.recv() => if request.is_some() { true } else { break },
-                _ = interval.tick() => self.ws_client.is_active(),
+                _ = interval.tick() => self.ws_client.is_active() && self.poll_due(verified, idle),
             };
 
             if !recover {
                 continue;
+            }
+
+            if !debounce.is_zero() {
+                // Sibling notices of one venue action would each void a pass that began earlier
+                let settled = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => break,
+                    settled = self.settle(&mut receiver, &mut requests, debounce) => settled,
+                };
+
+                if !settled {
+                    break;
+                }
             }
 
             let result = tokio::select! {
@@ -121,6 +123,8 @@ impl PrivateStream {
 
             match result {
                 Ok(()) => {
+                    verified = Some(time::Instant::now());
+
                     if let Some(startup) = startup.take() {
                         let _ = startup.send(Ok(()));
                     }
@@ -151,6 +155,70 @@ impl PrivateStream {
         if let Err(e) = self.ws_client.stop().await {
             log::warn!("Kalshi private shutdown failed: {e}");
         }
+    }
+
+    /// Applies one transport event and returns whether it requires a recovery pass now.
+    fn observe(&self, event: KalshiWsEvent) -> bool {
+        match event {
+            KalshiWsEvent::Ready { .. } => {
+                self.ready.store(false, Ordering::Release);
+                self.state
+                    .lock()
+                    .expect("private state lock is not poisoned")
+                    .invalidate();
+                true
+            }
+            KalshiWsEvent::Error { message, .. } => {
+                self.ready.store(false, Ordering::Release);
+                self.state
+                    .lock()
+                    .expect("private state lock is not poisoned")
+                    .invalidate();
+                log::warn!("Kalshi private stream requires recovery: {message}");
+                false
+            }
+            KalshiWsEvent::Message { message, .. } => self.notice(&message),
+            _ => false,
+        }
+    }
+
+    /// Returns whether the periodic timer should start a pass.
+    ///
+    /// An unready client always retries. A ready client repeats its last completed pass only
+    /// after the idle interval, which leaves the one-per-second balance read available to the
+    /// pass that a private notice starts.
+    fn poll_due(&self, verified: Option<time::Instant>, idle: Duration) -> bool {
+        idle <= Duration::from_secs(1)
+            || !self.ready.load(Ordering::Acquire)
+            || verified.is_none_or(|verified| verified.elapsed() >= idle)
+    }
+
+    /// Waits for the debounce delay while recording further notices, then drops queued requests
+    /// which the coming pass serves. Returns `false` when the transport closed.
+    async fn settle(
+        &self,
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<KalshiWsEvent>,
+        requests: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+        debounce: Duration,
+    ) -> bool {
+        let delay = time::sleep(debounce);
+        tokio::pin!(delay);
+
+        loop {
+            tokio::select! {
+                biased;
+                event = receiver.recv() => match event {
+                    Some(event) => {
+                        self.observe(event);
+                    }
+                    None => return false,
+                },
+                () = &mut delay => break,
+            }
+        }
+
+        while requests.try_recv().is_ok() {}
+        true
     }
 
     async fn recover(
@@ -1014,6 +1082,82 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[rstest]
+    #[case(1, true, Some(0), true)]
+    #[case(30, false, Some(0), true)]
+    #[case(30, true, None, true)]
+    #[case(30, true, Some(0), false)]
+    #[case(2, true, Some(0), false)]
+    fn ready_client_polls_only_after_the_idle_interval(
+        #[case] idle_secs: u64,
+        #[case] ready: bool,
+        #[case] verified_secs_ago: Option<u64>,
+        #[case] due: bool,
+    ) {
+        let stream = stream(&KalshiDataClientConfig::default());
+        stream.ready.store(ready, Ordering::Release);
+        let verified = verified_secs_ago.map(|secs| {
+            time::Instant::now()
+                .checked_sub(Duration::from_secs(secs))
+                .unwrap()
+        });
+        assert_eq!(
+            stream.poll_due(verified, Duration::from_secs(idle_secs)),
+            due
+        );
+    }
+
+    #[rstest]
+    fn elapsed_idle_interval_makes_a_ready_client_poll() {
+        let stream = stream(&KalshiDataClientConfig::default());
+        let verified = time::Instant::now().checked_sub(Duration::from_secs(31));
+        assert!(verified.is_some());
+        assert!(stream.poll_due(verified, Duration::from_secs(30)));
+    }
+
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    #[tokio::test]
+    async fn debounce_records_a_burst_of_notices_and_drops_served_requests() {
+        let stream = stream(&KalshiDataClientConfig::default());
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_data/websocket_messages.json")).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (request, mut requests) = tokio::sync::mpsc::unbounded_channel();
+
+        for key in ["fill", "order_native", "position_notice"] {
+            sender
+                .send(KalshiWsEvent::Message {
+                    generation: 1,
+                    message: serde_json::from_value(fixtures[key].clone()).unwrap(),
+                })
+                .unwrap();
+        }
+
+        request.send(()).unwrap();
+        request.send(()).unwrap();
+        let session = stream.state.lock().unwrap().session.clone();
+        let started = time::Instant::now();
+
+        assert!(
+            stream
+                .settle(&mut receiver, &mut requests, Duration::from_millis(60))
+                .await
+        );
+
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        assert!(receiver.try_recv().is_err());
+        assert!(requests.try_recv().is_err());
+        assert!(!stream.ready.load(Ordering::Acquire));
+        assert_ne!(stream.state.lock().unwrap().session, session);
+
+        drop(sender);
+        assert!(
+            !stream
+                .settle(&mut receiver, &mut requests, Duration::from_millis(60))
+                .await
+        );
     }
 
     #[rstest]

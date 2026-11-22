@@ -1064,6 +1064,12 @@ explains the rounding mechanics; it does not establish `fee_cost` semantics.
   fee metadata for open orders. Shared rate limits can delay readiness; budget other clients against
   the same account limits.
 - **Polling**: A one-second timer requests serial recovery while the private WebSocket is active.
+  With `recovery_idle_interval_secs` above `1`, a ready client repeats a completed pass only after
+  that interval, which leaves the balance read available to the pass an order event starts. Private
+  notices, command outcomes, and an unready client still start a pass without waiting for it.
+- **Notice bursts**: One venue action can send order, fill, and position notices. A notice which
+  arrives during a pass voids that pass. `recovery_debounce_ms` delays the pass so that it starts
+  after the burst.
   Passes can run back to back when reads take longer than the interval. Basic and Advanced accounts
   have one balance read per second; each open order also requires event and series fee reads.
 - **Account history**: Each successful recovery publishes `AccountState`, including unchanged
@@ -1276,9 +1282,15 @@ cached orders. Keep clients active until their positions settle.
 | `ws_timeout_secs`   | `30`         | WebSocket connection, subscription-restoration, bootstrap, and account-observation timeout. |
 | `transport_backend` | `Sockudo`    | Required WebSocket backend; `Tungstenite` is rejected.                                      |
 
-The execution client also accepts `admit_collateral_netting` (default `False`). It admits `MECNET`
-and `DIRECNET` event markets only while Kalshi reports netting disabled for the subaccount. See
-[Collateral-return netting events](#collateral-return-netting-events).
+The execution client also accepts:
+
+- `admit_collateral_netting` (default `False`): Admit `MECNET` and `DIRECNET` event markets only
+  while Kalshi reports netting disabled for the subaccount. See
+  [Collateral-return netting events](#collateral-return-netting-events).
+- `recovery_idle_interval_secs` (default `1`): Seconds between private recovery passes while the
+  client is ready. An unready client retries every second.
+- `recovery_debounce_ms` (default `0`, at most `1000`): Delay between the first private notice and
+  the recovery pass it starts.
 
 ### Shared validation
 

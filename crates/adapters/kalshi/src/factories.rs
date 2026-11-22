@@ -278,6 +278,8 @@ mod tests {
             subaccount: 7,
             transport_backend: TransportBackend::Sockudo,
             admit_collateral_netting: false,
+            recovery_idle_interval_secs: 1,
+            recovery_debounce_ms: 0,
         }
     }
 

@@ -10,5 +10,7 @@
   "transport_backend": "sockudo",
   "account_id": "KALSHI-TEST",
   "exchange_index": 3,
-  "admit_collateral_netting": true
+  "admit_collateral_netting": true,
+  "recovery_idle_interval_secs": 5,
+  "recovery_debounce_ms": 150
 }

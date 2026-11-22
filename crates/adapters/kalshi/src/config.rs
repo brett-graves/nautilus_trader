@@ -250,6 +250,14 @@ pub struct KalshiExecutionClientConfig {
     /// models returned collateral.
     #[builder(default)]
     pub admit_collateral_netting: bool,
+    /// Positive interval in seconds between private recovery passes while the client is ready.
+    /// An unready client retries every second; one second keeps a pass on every timer tick.
+    #[builder(default = 1)]
+    pub recovery_idle_interval_secs: u64,
+    /// Delay in milliseconds between the first private notice and the recovery pass it starts,
+    /// so one pass covers a burst of notices; zero starts the pass immediately.
+    #[builder(default)]
+    pub recovery_debounce_ms: u64,
 }
 
 #[cfg(feature = "python")]
@@ -262,6 +270,8 @@ nautilus_core::impl_pyo3_config_getters!(KalshiExecutionClientConfig {
     subaccount: u32,
     transport_backend: TransportBackend,
     admit_collateral_netting: bool,
+    recovery_idle_interval_secs: u64,
+    recovery_debounce_ms: u64,
 });
 
 impl Default for KalshiExecutionClientConfig {
@@ -342,6 +352,27 @@ impl KalshiExecutionClientConfig {
             self.ws_timeout_secs,
             self.transport_backend,
         )?;
+        validate_positive(
+            "recovery_idle_interval_secs",
+            self.recovery_idle_interval_secs,
+        )?;
+
+        if Instant::now()
+            .checked_add(Duration::from_secs(self.recovery_idle_interval_secs))
+            .is_none()
+        {
+            return Err(ConfigError::invalid_value(
+                "recovery_idle_interval_secs",
+                "exceeds the supported clock range",
+            ));
+        }
+
+        if self.recovery_debounce_ms > 1_000 {
+            return Err(ConfigError::invalid_value(
+                "recovery_debounce_ms",
+                "must not exceed 1000",
+            ));
+        }
 
         Ok(())
     }
@@ -500,6 +531,28 @@ mod tests {
     use super::*;
 
     #[rstest]
+    #[case(0, 0, Some("recovery_idle_interval_secs"))]
+    #[case(u64::MAX, 0, Some("recovery_idle_interval_secs"))]
+    #[case(1, 1_001, Some("recovery_debounce_ms"))]
+    #[case(30, 1_000, None)]
+    fn execution_recovery_pacing_is_bounded(
+        #[case] idle: u64,
+        #[case] debounce: u64,
+        #[case] field: Option<&str>,
+    ) {
+        let config = KalshiExecutionClientConfig::builder()
+            .recovery_idle_interval_secs(idle)
+            .recovery_debounce_ms(debounce)
+            .build();
+        let result = config.validate();
+
+        match field {
+            Some(field) => assert!(result.unwrap_err().to_string().contains(field)),
+            None => result.unwrap(),
+        }
+    }
+
+    #[rstest]
     #[case(0, true)]
     #[case(7, true)]
     #[case(63, true)]
@@ -564,6 +617,8 @@ mod tests {
                 subaccount: 0,
                 transport_backend: TransportBackend::Sockudo,
                 admit_collateral_netting: false,
+                recovery_idle_interval_secs: 1,
+                recovery_debounce_ms: 0,
             }
         );
         assert!(!data.has_credentials());
@@ -665,6 +720,8 @@ mod tests {
             .ws_timeout_secs(19)
             .exchange_index(3)
             .admit_collateral_netting(true)
+            .recovery_idle_interval_secs(5)
+            .recovery_debounce_ms(150)
             .transport_backend(TransportBackend::Sockudo)
             .build();
         let round_trip_data: KalshiDataClientConfig =

@@ -594,6 +594,48 @@ fn account_or_recovered_order(
     }
 }
 
+#[rstest]
+#[case(1, true)]
+#[case(30, false)]
+#[tokio::test]
+async fn ready_client_repeats_recovery_at_the_configured_idle_interval(
+    #[case] idle_secs: u64,
+    #[case] repeats: bool,
+) {
+    tokio::time::timeout(Duration::from_secs(18), async {
+        let mut peer = Peer::with_timeout(None, 10).await;
+        peer.config.recovery_idle_interval_secs = idle_secs;
+        peer.config.recovery_debounce_ms = 100;
+        let (harness, mut output, _data) = native_consumer(&peer).await;
+
+        native_wait(&mut output, || {
+            harness
+                .exec_engine()
+                .borrow()
+                .get_client(&harness.client_id())
+                .unwrap()
+                .is_connected()
+        })
+        .await;
+
+        // A pass which began before readiness may still finish its second balance read
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let before = peer.balance_reads.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(3_300)).await;
+        let reads = peer.balance_reads.load(Ordering::SeqCst) - before;
+
+        if repeats {
+            assert!(reads >= 2, "expected periodic recovery, observed {reads}");
+        } else {
+            assert_eq!(reads, 0);
+        }
+
+        native_disconnect(&harness).await;
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn bootstrap_accepts_advancing_timestamps_and_marks_and_reconnect_uses_a_new_session() {
     tokio::time::timeout(Duration::from_secs(15), async {

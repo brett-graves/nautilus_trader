@@ -115,7 +115,7 @@ impl KalshiDataClientConfig {
 impl KalshiExecutionClientConfig {
     /// Configuration for the Kalshi execution client.
     #[new]
-    #[pyo3(signature = (account_id = None, api_key_id = None, private_key = None, environment = None, base_url_http = None, base_url_ws = None, proxy_url = None, http_timeout_secs = None, ws_timeout_secs = None, exchange_index = None, transport_backend = None, subaccount = None, admit_collateral_netting = None))]
+    #[pyo3(signature = (account_id = None, api_key_id = None, private_key = None, environment = None, base_url_http = None, base_url_ws = None, proxy_url = None, http_timeout_secs = None, ws_timeout_secs = None, exchange_index = None, transport_backend = None, subaccount = None, admit_collateral_netting = None, recovery_idle_interval_secs = None, recovery_debounce_ms = None))]
     #[expect(
         clippy::too_many_arguments,
         reason = "thin projection of the Rust config fields"
@@ -134,6 +134,8 @@ impl KalshiExecutionClientConfig {
         transport_backend: Option<TransportBackend>,
         subaccount: Option<u32>,
         admit_collateral_netting: Option<bool>,
+        recovery_idle_interval_secs: Option<u64>,
+        recovery_debounce_ms: Option<u64>,
     ) -> PyResult<Self> {
         let defaults = Self::default();
 
@@ -152,6 +154,9 @@ impl KalshiExecutionClientConfig {
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
             admit_collateral_netting: admit_collateral_netting
                 .unwrap_or(defaults.admit_collateral_netting),
+            recovery_idle_interval_secs: recovery_idle_interval_secs
+                .unwrap_or(defaults.recovery_idle_interval_secs),
+            recovery_debounce_ms: recovery_debounce_ms.unwrap_or(defaults.recovery_debounce_ms),
         };
 
         config.validate().map_err(config_error_to_pyvalue_err)?;
@@ -238,6 +243,8 @@ mod tests {
                     .unwrap();
                 kwargs.set_item("exchange_index", 3).unwrap();
                 kwargs.set_item("subaccount", 7).unwrap();
+                kwargs.set_item("recovery_idle_interval_secs", 5).unwrap();
+                kwargs.set_item("recovery_debounce_ms", 150).unwrap();
             }
 
             let config = class.call((), Some(&kwargs)).unwrap();
@@ -282,6 +289,8 @@ mod tests {
                     transport_backend: backend,
                     subaccount: 7,
                     admit_collateral_netting: true,
+                    recovery_idle_interval_secs: 5,
+                    recovery_debounce_ms: 150,
                 };
 
                 assert_eq!(actual, expected);
