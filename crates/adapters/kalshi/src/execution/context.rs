@@ -26,7 +26,9 @@ use nautilus_common::{
 use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::{ExecutionEventEmitter, execution::context::OrderContext};
 use nautilus_model::{
-    enums::{AccountType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce},
+    enums::{
+        AccountType, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
+    },
     events::{
         AccountState, OrderAccepted, OrderCanceled, OrderDenied, OrderEventAny, OrderFilled,
         OrderRejected, OrderSubmitted, OrderUpdated,
@@ -35,7 +37,7 @@ use nautilus_model::{
     instruments::BinaryOption,
     orders::{LimitOrder, Order, OrderAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, Currency, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -78,6 +80,8 @@ pub struct PrivateState {
     covered_fills: HashMap<InstrumentId, UnixNanos>,
     notices_orders: HashMap<VenueOrderId, OrderNotice>,
     pub(super) notices_positions: HashMap<InstrumentId, PositionNotice>,
+    direct_fills: HashMap<TradeId, DirectFill>,
+    direct_cancels: HashMap<ClientOrderId, DirectCancel>,
 }
 
 #[allow(
@@ -113,6 +117,8 @@ impl PrivateState {
             covered_fills: HashMap::new(),
             notices_orders: HashMap::new(),
             notices_positions: HashMap::new(),
+            direct_fills: HashMap::new(),
+            direct_cancels: HashMap::new(),
         }
     }
 
@@ -608,7 +614,11 @@ impl PrivateState {
 
     pub(super) fn notice(&mut self, message: &KalshiWsMessage) -> anyhow::Result<()> {
         self.invalidate();
+        self.record_notice(message)
+    }
 
+    /// Records a private notice for the next recovery pass without fencing commands.
+    pub(super) fn record_notice(&mut self, message: &KalshiWsMessage) -> anyhow::Result<()> {
         match message {
             KalshiWsMessage::Fill(data) => self.notice_fill(&data.msg),
             KalshiWsMessage::UserOrder(data) => self.notice_order(&data.msg),
@@ -751,6 +761,320 @@ impl PrivateState {
         );
         notice.volume = notice.volume.max(volume.0);
         notice.economics = Some(serde_json::from_value(value.clone())?);
+        Ok(())
+    }
+
+    /// Emits one fill from a private fill message ahead of recovery.
+    ///
+    /// Returns `Ok(false)` when the message cannot establish a complete fill for an order this
+    /// client owns; recovery then produces the fill. An emitted fill changes the order only.
+    /// Cash and the account net change when recovery accounts for the same trade, which also
+    /// compares the venue record with what was emitted here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the message is malformed, contradicts the order, or cannot be routed.
+    pub(super) fn direct_fill(
+        &mut self,
+        value: &serde_json::Value,
+        emitter: &ExecutionEventEmitter,
+    ) -> anyhow::Result<bool> {
+        let message: DirectFillMessage = serde_json::from_value(value.clone())
+            .context("private fill message lacks fields a fill event requires")?;
+        let trade_id = TradeId::new_checked(&message.trade_id)?;
+        let venue_id = VenueOrderId::new_checked(&message.order_id)?;
+
+        let id = self.bindings.get(&venue_id).copied().or_else(|| {
+            message
+                .client_order_id
+                .as_deref()
+                .and_then(|id| ClientOrderId::new_checked(id).ok())
+                .filter(|id| {
+                    self.orders
+                        .get(id)
+                        .is_some_and(|context| context.order.venue_order_id().is_none())
+                })
+        });
+
+        let Some(id) = id else {
+            return Ok(false);
+        };
+
+        if self.fill_accounted(id, trade_id) {
+            return Ok(true);
+        }
+
+        let context = self
+            .orders
+            .get(&id)
+            .context("bound order context missing")?;
+        let order = &context.order;
+
+        if order.trade_ids().contains(&&trade_id) {
+            return Ok(true);
+        }
+
+        if order.strategy_id().is_external()
+            || !matches!(
+                order.status(),
+                OrderStatus::Submitted
+                    | OrderStatus::Accepted
+                    | OrderStatus::PartiallyFilled
+                    | OrderStatus::PendingCancel
+            )
+        {
+            return Ok(false);
+        }
+
+        let instrument_id = crate::common::parse::parse_instrument_id(&message.market_ticker)?;
+        let side = reports::direction(message.book_side, message.outcome_side)?;
+        anyhow::ensure!(
+            instrument_id == order.instrument_id()
+                && side == order.order_side()
+                && order.venue_order_id().is_none_or(|known| known == venue_id),
+            "private fill message contradicts its order"
+        );
+        let qty = crate::data::parse::size(message.count_fp, order.quantity().precision)?;
+        let px = crate::data::parse::price(
+            message.yes_price_dollars,
+            order
+                .price()
+                .context("owned limit order lacks price")?
+                .precision,
+        )?;
+        anyhow::ensure!(
+            qty.is_positive() && qty <= order.leaves_qty(),
+            "private fill message exceeds the open quantity"
+        );
+        anyhow::ensure!(
+            message.fee_cost.0 >= Decimal::ZERO,
+            "negative private fill fee"
+        );
+        let commission = Money::from_decimal_exact(message.fee_cost.0, Currency::USD())?;
+        let ts_event = UnixNanos::from(
+            message
+                .ts_ms
+                .checked_mul(1_000_000)
+                .context("private fill timestamp overflow")?,
+        );
+
+        let liquidity_side = if message.is_taker {
+            LiquiditySide::Taker
+        } else {
+            LiquiditySide::Maker
+        };
+
+        let now = get_atomic_clock_realtime().get_time_ns();
+        let mut next = order.clone();
+        let mut events = Vec::new();
+
+        if next.venue_order_id().is_none() {
+            // A fill naming this client order proves the venue accepted it
+            let event = OrderEventAny::Accepted(OrderAccepted::new(
+                next.trader_id(),
+                next.strategy_id(),
+                instrument_id,
+                id,
+                venue_id,
+                emitter.account_id(),
+                UUID4::new(),
+                ts_event,
+                now,
+                false,
+            ));
+            next.apply(event.clone())?;
+            events.push(event);
+        }
+
+        let event = OrderEventAny::Filled(OrderFilled::new(
+            next.trader_id(),
+            next.strategy_id(),
+            instrument_id,
+            id,
+            venue_id,
+            emitter.account_id(),
+            trade_id,
+            side,
+            OrderType::Limit,
+            qty,
+            px,
+            Currency::USD(),
+            liquidity_side,
+            UUID4::new(),
+            ts_event,
+            now,
+            false,
+            None,
+            Some(commission),
+            None,
+        ));
+        next.apply(event.clone())?;
+        events.push(event);
+
+        for event in events {
+            emitter.try_send_order_event(event)?;
+        }
+
+        self.orders
+            .get_mut(&id)
+            .expect("bound order context exists")
+            .order = next;
+        self.bindings.insert(venue_id, id);
+        self.direct_fills.insert(
+            trade_id,
+            DirectFill {
+                qty,
+                px,
+                commission: message.fee_cost.0,
+                liquidity_side,
+            },
+        );
+        self.finish_direct_cancel(id, emitter)?;
+        Ok(true)
+    }
+
+    /// Emits a cancellation from a successful cancel reply ahead of recovery.
+    ///
+    /// `reduced_by` is the quantity the venue removed. The event waits for the fills which the
+    /// reply implies but this client has not yet emitted. Returns `Ok(false)` when the reply does
+    /// not establish a cancellation; recovery then resolves the order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event cannot be applied or routed.
+    pub(super) fn direct_cancel(
+        &mut self,
+        id: ClientOrderId,
+        reduced_by: Decimal,
+        ts_event: UnixNanos,
+        emitter: &ExecutionEventEmitter,
+    ) -> anyhow::Result<bool> {
+        let Some(context) = self.orders.get(&id) else {
+            return Ok(false);
+        };
+
+        let order = &context.order;
+        let filled = order
+            .quantity()
+            .as_decimal()
+            .checked_sub(reduced_by)
+            .context("cancel acknowledgement count overflow")?;
+
+        if order.is_closed()
+            || order.strategy_id().is_external()
+            || reduced_by <= Decimal::ZERO
+            || filled < order.filled_qty().as_decimal()
+        {
+            return Ok(false);
+        }
+
+        self.direct_cancels.insert(
+            id,
+            DirectCancel {
+                filled,
+                ts_event,
+                emitted: false,
+            },
+        );
+        self.finish_direct_cancel(id, emitter)?;
+        Ok(true)
+    }
+
+    fn finish_direct_cancel(
+        &mut self,
+        id: ClientOrderId,
+        emitter: &ExecutionEventEmitter,
+    ) -> anyhow::Result<()> {
+        let Some(pending) = self.direct_cancels.get(&id).copied() else {
+            return Ok(());
+        };
+
+        let Some(context) = self.orders.get(&id) else {
+            return Ok(());
+        };
+
+        let order = &context.order;
+
+        if pending.emitted || order.is_closed() || order.filled_qty().as_decimal() != pending.filled
+        {
+            return Ok(());
+        }
+
+        let event = OrderEventAny::Canceled(OrderCanceled::new(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            id,
+            UUID4::new(),
+            pending.ts_event.max(order.ts_last()),
+            get_atomic_clock_realtime().get_time_ns(),
+            false,
+            order.venue_order_id(),
+            Some(emitter.account_id()),
+            None,
+        ));
+        let mut next = order.clone();
+        next.apply(event.clone())?;
+        emitter.try_send_order_event(event)?;
+        let unfilled = next.filled_qty().is_zero();
+        self.orders
+            .get_mut(&id)
+            .expect("canceled order context exists")
+            .order = next;
+        self.direct_cancels
+            .get_mut(&id)
+            .expect("pending cancellation exists")
+            .emitted = true;
+        self.mutations.remove(&id);
+        self.ledger.invalidate();
+
+        // Without fills the order consumed no cash, so its whole hold is free again
+        if unfilled && self.ledger.reservation(id).is_some() {
+            self.ledger.release(id);
+            self.publish_balance(emitter, get_atomic_clock_realtime().get_time_ns())?;
+        }
+
+        Ok(())
+    }
+
+    /// Returns whether direct events or notices still await recovery.
+    pub(super) fn has_unverified_events(&self) -> bool {
+        !self.direct_fills.is_empty()
+            || !self.direct_cancels.is_empty()
+            || !self.notices_fills.is_empty()
+            || !self.notices_orders.is_empty()
+            || !self.notices_positions.is_empty()
+    }
+
+    fn audit_direct_fill(&self, fill: &FillReport) -> anyhow::Result<()> {
+        let Some(direct) = self.direct_fills.get(&fill.trade_id) else {
+            return Ok(());
+        };
+
+        if direct.qty != fill.last_qty
+            || direct.px != fill.last_px
+            || direct.commission != fill.commission.as_decimal()
+            || direct.liquidity_side != fill.liquidity_side
+        {
+            return Err(RecoveryAuditError::Fill(fill.trade_id).into());
+        }
+
+        Ok(())
+    }
+
+    fn audit_direct_cancel(&self, order: &OrderAny, source: &VenueOrder) -> anyhow::Result<()> {
+        let id = order.client_order_id();
+
+        if self
+            .direct_cancels
+            .get(&id)
+            .is_some_and(|direct| direct.emitted)
+            && (source.status != VenueStatus::Canceled
+                || source.fill_count_fp.0 != order.filled_qty().as_decimal())
+        {
+            return Err(RecoveryAuditError::Cancel(id).into());
+        }
+
         Ok(())
     }
 
@@ -1131,6 +1455,7 @@ impl PrivateState {
         }
 
         self.check_settled_order(source, fills, &order, instrument.id)?;
+        self.audit_direct_cancel(&order, source)?;
 
         let original = order.clone();
         let mut before = Vec::new();
@@ -1203,6 +1528,7 @@ impl PrivateState {
             );
 
             if order.trade_ids().contains(&&fill.trade_id) {
+                self.audit_direct_fill(fill)?;
                 fresh.push((None, fill.clone()));
                 continue;
             }
@@ -1844,6 +2170,7 @@ impl PrivateState {
                 .expect("plan owns context")
                 .accounted
                 .insert(report.trade_id);
+            self.direct_fills.remove(&report.trade_id);
             self.positions_ts
                 .entry(report.instrument_id)
                 .and_modify(|ts| *ts = (*ts).max(report.ts_event))
@@ -1956,6 +2283,7 @@ impl PrivateState {
 
         if plan.mapped && plan.result.is_closed() {
             self.ledger.release(id);
+            self.direct_cancels.remove(&id);
         }
 
         Ok(())
@@ -2040,6 +2368,52 @@ fn terminal_progress(order: &OrderAny, source: &VenueOrder) -> bool {
         && source.client_order_id == order.client_order_id().as_str()
         && matches!(source.status, VenueStatus::Canceled | VenueStatus::Executed)
         && source.fill_count_fp.0 >= order.filled_qty().as_decimal()
+}
+
+/// A fill emitted from the private stream which recovery has not yet accounted for.
+#[derive(Debug, Clone, Copy)]
+struct DirectFill {
+    qty: Quantity,
+    px: Price,
+    commission: Decimal,
+    liquidity_side: LiquiditySide,
+}
+
+/// A cancellation taken from a cancel reply which recovery has not yet confirmed.
+#[derive(Debug, Clone, Copy)]
+struct DirectCancel {
+    filled: Decimal,
+    ts_event: UnixNanos,
+    emitted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectFillMessage {
+    trade_id: String,
+    order_id: String,
+    #[serde(default)]
+    client_order_id: Option<String>,
+    market_ticker: String,
+    is_taker: bool,
+    yes_price_dollars: FixedPoint,
+    count_fp: FixedPoint,
+    fee_cost: FixedPoint,
+    outcome_side: crate::http::models::OutcomeSide,
+    book_side: crate::http::models::BookSide,
+    ts_ms: u64,
+}
+
+/// A venue record which contradicts an order event this client emitted ahead of recovery.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RecoveryAuditError {
+    #[error(
+        "KALSHI_DIRECT_FILL_MISMATCH: venue fill {0} differs from the fill emitted from the private stream"
+    )]
+    Fill(TradeId),
+    #[error(
+        "KALSHI_DIRECT_CANCEL_MISMATCH: venue order for {0} contradicts the cancellation emitted from the cancel reply"
+    )]
+    Cancel(ClientOrderId),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2337,6 +2711,293 @@ mod tests {
 
         emitter.set_sender(sender);
         (emitter, receiver)
+    }
+
+    fn fill_message(source: &VenueOrder, report: &FillReport, fee: &str) -> Value {
+        serde_json::json!({
+            "trade_id": report.trade_id.as_str(),
+            "order_id": source.order_id,
+            "client_order_id": source.client_order_id,
+            "market_ticker": source.ticker,
+            "exchange_index": 3,
+            "is_taker": true,
+            "yes_price_dollars": source.yes_price_dollars.0.to_string(),
+            "count_fp": report.last_qty.as_decimal().to_string(),
+            "fee_cost": fee,
+            "outcome_side": source.outcome_side,
+            "book_side": source.book_side,
+            "ts_ms": report.ts_event.as_u64() / 1_000_000,
+        })
+    }
+
+    fn order_events(
+        output: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    ) -> Vec<OrderEventAny> {
+        let mut events = Vec::new();
+
+        while let Ok(event) = output.try_recv() {
+            if let ExecutionEvent::Order(event) = event {
+                events.push(event);
+            }
+        }
+
+        events
+    }
+
+    #[rstest]
+    fn direct_fill_emits_once_and_recovery_accounts_without_replay() {
+        let instrument = instrument();
+        let source = source(&instrument, OrderSide::Buy);
+        let order = submitted(&instrument, OrderSide::Buy, &source.client_order_id);
+        let id = order.client_order_id();
+        let mut state = state(order, &instrument);
+        let (emitter, mut output) = emitter();
+        let report = report(&source, &instrument, emitter.account_id());
+        let fee = report.commission.as_decimal().to_string();
+        let message = fill_message(&source, &report, &fee);
+        let total = state.ledger.balance().unwrap().total;
+
+        assert!(state.direct_fill(&message, &emitter).unwrap());
+        assert!(state.direct_fill(&message, &emitter).unwrap());
+
+        let events = order_events(&mut output);
+        assert_eq!(events.len(), 2);
+        let OrderEventAny::Accepted(accepted) = &events[0] else {
+            panic!("expected Accepted");
+        };
+        assert_eq!(accepted.venue_order_id.as_str(), source.order_id);
+        let OrderEventAny::Filled(filled) = &events[1] else {
+            panic!("expected Filled");
+        };
+        assert_eq!(filled.client_order_id, id);
+        assert_eq!(filled.trade_id, report.trade_id);
+        assert_eq!(filled.last_qty, report.last_qty);
+        assert_eq!(filled.last_px, report.last_px);
+        assert_eq!(filled.commission, Some(report.commission));
+        assert_eq!(filled.liquidity_side, LiquiditySide::Taker);
+        assert_eq!(filled.order_side, OrderSide::Buy);
+
+        // The event changes the order only; cash and the account net wait for recovery
+        assert!(state.has_unverified_events());
+        assert_eq!(state.ledger.balance().unwrap().total, total);
+        assert_eq!(state.positions[&instrument.id], Decimal::ZERO);
+
+        let plan = state
+            .plan_order(
+                &source,
+                std::slice::from_ref(&report),
+                &instrument,
+                &emitter,
+                UnixNanos::from(543),
+            )
+            .unwrap()
+            .unwrap();
+        state.apply_plans(vec![plan], &emitter).unwrap();
+
+        // The fixture order rests at another price, which recovery reports as an update
+        assert!(
+            order_events(&mut output)
+                .iter()
+                .all(|event| matches!(event, OrderEventAny::Updated(_)))
+        );
+        assert!(!state.has_unverified_events());
+        assert_eq!(
+            state.positions[&instrument.id],
+            report.last_qty.as_decimal()
+        );
+        assert_eq!(state.orders[&id].order.filled_qty(), report.last_qty);
+    }
+
+    #[rstest]
+    #[case::fee("fee")]
+    #[case::quantity("quantity")]
+    fn recovery_rejects_a_venue_fill_which_differs_from_the_direct_fill(#[case] field: &str) {
+        let instrument = instrument();
+        let source = source(&instrument, OrderSide::Buy);
+        let order = submitted(&instrument, OrderSide::Buy, &source.client_order_id);
+        let mut state = state(order, &instrument);
+        let (emitter, _output) = emitter();
+        let mut report = report(&source, &instrument, emitter.account_id());
+        let fee = report.commission.as_decimal().to_string();
+        let message = fill_message(&source, &report, &fee);
+        assert!(state.direct_fill(&message, &emitter).unwrap());
+
+        if field == "fee" {
+            report.commission =
+                Money::from_decimal_exact(Decimal::new(5, 6), Currency::USD()).unwrap();
+        } else {
+            report.last_qty = Quantity::from("0.50");
+        }
+
+        let error = state
+            .plan_order(
+                &source,
+                std::slice::from_ref(&report),
+                &instrument,
+                &emitter,
+                UnixNanos::from(543),
+            )
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            error.downcast_ref::<RecoveryAuditError>(),
+            Some(RecoveryAuditError::Fill(id)) if *id == report.trade_id
+        ));
+    }
+
+    #[rstest]
+    #[case::missing_fee("fee_cost")]
+    #[case::missing_price("yes_price_dollars")]
+    #[case::missing_count("count_fp")]
+    #[case::missing_liquidity("is_taker")]
+    #[case::missing_time("ts_ms")]
+    #[case::missing_side("book_side")]
+    fn incomplete_or_foreign_fill_message_leaves_the_fill_to_recovery(#[case] field: &str) {
+        let instrument = instrument();
+        let source = source(&instrument, OrderSide::Buy);
+        let order = submitted(&instrument, OrderSide::Buy, &source.client_order_id);
+        let mut state = state(order, &instrument);
+        let (emitter, mut output) = emitter();
+        let report = report(&source, &instrument, emitter.account_id());
+        let complete = fill_message(&source, &report, "0.000001");
+
+        let mut incomplete = complete.clone();
+        incomplete.as_object_mut().unwrap().remove(field);
+        assert!(state.direct_fill(&incomplete, &emitter).is_err());
+
+        let mut foreign = complete.clone();
+        foreign["order_id"] = "another-order".into();
+        foreign["client_order_id"] = "another-client".into();
+        assert!(!state.direct_fill(&foreign, &emitter).unwrap());
+
+        let mut opposite = complete;
+        opposite["book_side"] = "ask".into();
+        opposite["outcome_side"] = "no".into();
+        assert!(state.direct_fill(&opposite, &emitter).is_err());
+
+        assert_eq!(order_events(&mut output), Vec::new());
+        assert!(!state.has_unverified_events());
+    }
+
+    #[rstest]
+    fn direct_cancel_of_an_unfilled_order_emits_and_frees_its_hold() {
+        let instrument = instrument();
+        let order = submitted(&instrument, OrderSide::Buy, "client-a");
+        let id = order.client_order_id();
+        let mut state = state(order, &instrument);
+        let (emitter, mut output) = emitter();
+        state.ledger.reserve(id, Decimal::new(125, 2)).unwrap();
+
+        assert!(
+            !state
+                .direct_cancel(id, Decimal::ZERO, UnixNanos::from(9), &emitter)
+                .unwrap()
+        );
+        assert!(
+            !state
+                .direct_cancel(id, Decimal::from(3), UnixNanos::from(9), &emitter)
+                .unwrap()
+        );
+        assert_eq!(order_events(&mut output), Vec::new());
+
+        assert!(
+            state
+                .direct_cancel(id, Decimal::from(2), UnixNanos::from(9), &emitter)
+                .unwrap()
+        );
+
+        let mut canceled = 0;
+        let mut balances = Vec::new();
+
+        while let Ok(event) = output.try_recv() {
+            match event {
+                ExecutionEvent::Order(OrderEventAny::Canceled(event)) => {
+                    assert_eq!(event.client_order_id, id);
+                    canceled += 1;
+                }
+                ExecutionEvent::Account(account) => balances.push(account.balances[0]),
+                event => panic!("unexpected event {event:?}"),
+            }
+        }
+
+        assert_eq!(canceled, 1);
+        assert_eq!(balances.len(), 1);
+        assert!(balances[0].locked.is_zero());
+        assert_eq!(state.orders[&id].order.status(), OrderStatus::Canceled);
+        assert!(state.ledger.reservation(id).is_none());
+        assert!(
+            !state
+                .direct_cancel(id, Decimal::from(2), UnixNanos::from(9), &emitter)
+                .unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case::confirmed("canceled", "0.75", true)]
+    #[case::still_resting("resting", "0.75", false)]
+    #[case::executed("executed", "2.00", false)]
+    fn direct_cancel_waits_for_implied_fills_and_recovery_audits_it(
+        #[case] status: &str,
+        #[case] venue_filled: &str,
+        #[case] agrees: bool,
+    ) {
+        let instrument = instrument();
+        let mut source = source(&instrument, OrderSide::Buy);
+        let order = submitted(&instrument, OrderSide::Buy, &source.client_order_id);
+        let id = order.client_order_id();
+        let mut state = state(order, &instrument);
+        let (emitter, mut output) = emitter();
+        let report = report(&source, &instrument, emitter.account_id());
+        let fee = report.commission.as_decimal().to_string();
+        let ts_cancel = UnixNanos::from(report.ts_event.as_u64() + 1_000_000);
+        state.ledger.reserve(id, Decimal::new(125, 2)).unwrap();
+
+        // The reply removed 1.25 of 2.00, so 0.75 filled before the cancellation
+        assert!(
+            state
+                .direct_cancel(id, Decimal::new(125, 2), ts_cancel, &emitter)
+                .unwrap()
+        );
+        assert_eq!(order_events(&mut output), Vec::new());
+
+        assert!(
+            state
+                .direct_fill(&fill_message(&source, &report, &fee), &emitter)
+                .unwrap()
+        );
+        let events = order_events(&mut output);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], OrderEventAny::Accepted(_)));
+        assert!(matches!(events[1], OrderEventAny::Filled(_)));
+        assert!(matches!(events[2], OrderEventAny::Canceled(_)));
+        assert!(state.ledger.reservation(id).is_some());
+
+        source.status = serde_json::from_value(status.into()).unwrap();
+        source.fill_count_fp = FixedPoint(venue_filled.parse().unwrap());
+        source.remaining_count_fp = FixedPoint(Decimal::ZERO);
+
+        let result = state.plan_order(
+            &source,
+            std::slice::from_ref(&report),
+            &instrument,
+            &emitter,
+            UnixNanos::from(543),
+        );
+
+        if agrees {
+            state
+                .apply_plans(vec![result.unwrap().unwrap()], &emitter)
+                .unwrap();
+            assert_eq!(order_events(&mut output), Vec::new());
+            assert!(!state.has_unverified_events());
+            assert!(state.ledger.reservation(id).is_none());
+        } else {
+            assert!(matches!(
+                result.err().unwrap().downcast_ref::<RecoveryAuditError>(),
+                Some(RecoveryAuditError::Cancel(order)) if *order == id
+            ));
+        }
     }
 
     #[rstest]

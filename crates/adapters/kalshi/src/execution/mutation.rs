@@ -72,6 +72,8 @@ pub(super) struct Mutation {
     pub(super) deadline: Instant,
     pub(super) refresh: tokio::sync::mpsc::UnboundedSender<()>,
     pub(super) session: String,
+    /// Whether a cancellation skips readiness and resolves from its reply.
+    pub(super) direct: bool,
     pub(super) cancellation: CancellationToken,
 }
 
@@ -102,12 +104,15 @@ impl Mutation {
             &self.ws_client,
             &self.cancellation,
             &self.session,
+            !self.direct,
         );
         let result = self.send(&prepared).await;
 
         match result {
-            Ok((order_id, client_id, ts_ms, remaining)) => {
-                let result = self.acknowledge(&order_id, &client_id, ts_ms, remaining);
+            Ok((order_id, client_id, ts_ms, remaining, reduced_by)) => {
+                let result = self
+                    .acknowledge(&order_id, &client_id, ts_ms, remaining)
+                    .and_then(|()| self.resolve_direct(ts_ms, reduced_by));
 
                 if let Err(e) = result {
                     log::warn!("Kalshi change requires recovery: {e}");
@@ -129,7 +134,79 @@ impl Mutation {
         }
     }
 
+    /// Emits the cancellation which a successful direct cancel reply establishes.
+    fn resolve_direct(&self, ts_ms: i64, reduced_by: Option<FixedPoint>) -> anyhow::Result<()> {
+        let (true, Some(reduced_by)) = (self.direct, reduced_by) else {
+            return Ok(());
+        };
+
+        let nanos = u64::try_from(ts_ms)?
+            .checked_mul(NANOSECONDS_IN_MILLISECOND)
+            .context("Kalshi change timestamp overflow")?;
+
+        let emitted = self
+            .state
+            .lock()
+            .expect("private state lock is not poisoned")
+            .direct_cancel(
+                self.order.client_order_id(),
+                reduced_by.0,
+                UnixNanos::from(nanos),
+                &self.emitter,
+            )?;
+
+        if !emitted {
+            log::debug!("Kalshi cancel reply does not establish a cancellation");
+        }
+
+        Ok(())
+    }
+
+    /// Admits a cancellation of a venue order without waiting for recovery.
+    ///
+    /// A cancellation only reduces exposure, so it needs the connection it was issued on and an
+    /// open order with a venue identity. It does not need current cash or a verified account.
+    fn admit_direct(&self) -> anyhow::Result<Prepared> {
+        let prepared = prepare(
+            &self.command,
+            &self.order,
+            self.shard,
+            self.subaccount,
+            &self.definition,
+        )?;
+        let mut state = self
+            .state
+            .lock()
+            .expect("private state lock is not poisoned");
+        anyhow::ensure!(
+            self.ws_client.connection_epoch() == Some(self.epoch),
+            "Kalshi change connection generation changed before admission"
+        );
+        anyhow::ensure!(Instant::now() < self.deadline, ADMISSION_TIMEOUT_REASON);
+        let current = &state
+            .orders
+            .get(&self.order.client_order_id())
+            .context("Kalshi change context missing")?
+            .order;
+        anyhow::ensure!(!current.is_closed(), "Kalshi order is already closed");
+        anyhow::ensure!(
+            current.instrument_id() == self.order.instrument_id()
+                && current.order_side() == self.order.order_side()
+                && current.venue_order_id() == self.order.venue_order_id(),
+            "Kalshi order changed before admission"
+        );
+        self.mark_dispatched(&mut state, prepared.terms(), false)?;
+        Ok(prepared)
+    }
+
     async fn admit(&mut self) -> anyhow::Result<Prepared> {
+        if self.direct && self.order.venue_order_id().is_some() {
+            return self.admit_direct();
+        }
+
+        // Without a venue identity the cancellation waits for recovery like any other change
+        self.direct = false;
+
         loop {
             self.wait_for_recovery().await?;
             let (prepared, hold) = self.prepare().await?;
@@ -187,7 +264,7 @@ impl Mutation {
                 )?;
             }
 
-            self.mark_dispatched(&mut state, prepared.terms())?;
+            self.mark_dispatched(&mut state, prepared.terms(), true)?;
             return Ok(prepared);
         }
     }
@@ -196,6 +273,7 @@ impl Mutation {
         &self,
         state: &mut PrivateState,
         terms: Option<(Quantity, Price)>,
+        fence: bool,
     ) -> anyhow::Result<()> {
         let started = state
             .orders
@@ -216,7 +294,11 @@ impl Mutation {
         pending.dispatched = true;
         state.mutations_dispatched.insert(self.command.id());
         state.ledger.invalidate();
-        self.ready.store(false, Ordering::Release);
+
+        if fence {
+            self.ready.store(false, Ordering::Release);
+        }
+
         Ok(())
     }
 
@@ -325,7 +407,16 @@ impl Mutation {
     async fn send(
         &self,
         prepared: &Prepared,
-    ) -> Result<(String, Field<String>, i64, Option<FixedPoint>), KalshiHttpError> {
+    ) -> Result<
+        (
+            String,
+            Field<String>,
+            i64,
+            Option<FixedPoint>,
+            Option<FixedPoint>,
+        ),
+        KalshiHttpError,
+    > {
         let venue_id = self
             .order
             .venue_order_id()
@@ -354,7 +445,13 @@ impl Mutation {
                     Field::Missing | Field::Null => None,
                 };
 
-                Ok((ack.order_id, ack.client_order_id, ack.ts_ms, remaining))
+                Ok((
+                    ack.order_id,
+                    ack.client_order_id,
+                    ack.ts_ms,
+                    remaining,
+                    None,
+                ))
             }
             Prepared::Decrease { request, .. } => {
                 let ack = self
@@ -375,6 +472,7 @@ impl Mutation {
                     ack.client_order_id,
                     ack.ts_ms,
                     Some(ack.remaining_count),
+                    None,
                 ))
             }
             Prepared::Cancel => {
@@ -395,7 +493,13 @@ impl Mutation {
                     ));
                 }
 
-                Ok((ack.order_id, ack.client_order_id, ack.ts_ms, None))
+                Ok((
+                    ack.order_id,
+                    ack.client_order_id,
+                    ack.ts_ms,
+                    None,
+                    Some(ack.reduced_by),
+                ))
             }
         }
     }

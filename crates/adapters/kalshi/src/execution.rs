@@ -767,6 +767,7 @@ impl ExecutionClient for KalshiExecutionClient {
                 .collect(),
             ready: Arc::clone(&self.ready),
             ws_client: ws_client.clone(),
+            degraded: false,
         };
 
         self.session_tasks.spawn(stream.run(
@@ -863,7 +864,7 @@ impl ExecutionClient for KalshiExecutionClient {
             return Ok(());
         }
 
-        if let Some(submission) = self.submission(order, &cmd)?
+        if let Some(submission) = self.submission(order, &cmd, false)?
             && let Err(e) = self.command_tasks.spawn(submission.run())
         {
             log::warn!("Kalshi submission task was not registered: {e}");
@@ -924,7 +925,7 @@ impl ExecutionClient for KalshiExecutionClient {
         let prepared = (|| -> anyhow::Result<()> {
             for (order, child) in &children {
                 submissions.push(
-                    self.submission(order.clone(), child)?
+                    self.submission(order.clone(), child, true)?
                         .context("Kalshi order-list child failed validation")?,
                 );
             }
@@ -1573,7 +1574,12 @@ impl KalshiExecutionClient {
         &self,
         mut order: OrderAny,
         cmd: &SubmitOrder,
+        listed: bool,
     ) -> anyhow::Result<Option<submit::Submission>> {
+        // Reduce-only capacity and order lists read cache state that only a consumed account
+        // session fences, so they keep the session requirement with direct order events
+        let fenced = !self.config.direct_order_events || listed || order.is_reduce_only();
+
         let session = {
             let mut state = self
                 .private
@@ -1621,7 +1627,11 @@ impl KalshiExecutionClient {
         };
 
         anyhow::ensure!(
-            self.is_connected(),
+            if fenced {
+                self.is_connected()
+            } else {
+                self.is_recovered()
+            },
             "Kalshi submission requires current-session readiness"
         );
 
@@ -1661,6 +1671,7 @@ impl KalshiExecutionClient {
             ws_client,
             refresh,
             session,
+            fenced,
             cancellation: self.command_tasks.cancellation_token(),
         }))
     }
@@ -1839,6 +1850,34 @@ impl KalshiExecutionClient {
         Ok(())
     }
 
+    /// Returns whether the private stream is connected and recovery verified its connection.
+    ///
+    /// Unlike [`ExecutionClient::is_connected`], this does not require the cached account to
+    /// carry the current account session.
+    fn is_recovered(&self) -> bool {
+        self.observe_settlement();
+
+        let private = self
+            .private
+            .lock()
+            .expect("private state lock is not poisoned");
+
+        self.core.is_connected()
+            && self.ready.load(Ordering::Acquire)
+            && !private
+                .barrier
+                .lock()
+                .expect("settlement barrier lock")
+                .is_blocked()
+            && private.epoch.is_some()
+            && private.epoch
+                == self
+                    .ws_client
+                    .as_ref()
+                    .filter(|client| client.is_active())
+                    .and_then(KalshiWebSocketClient::connection_epoch)
+    }
+
     fn prepare_change(&self, command: &Command, cached: &OrderAny) -> anyhow::Result<Mutation> {
         let deadline = Instant::now() + ADMISSION_TIMEOUT;
         self.observe_settlement();
@@ -1928,6 +1967,7 @@ impl KalshiExecutionClient {
             deadline,
             refresh,
             session,
+            direct: self.config.direct_order_events && matches!(command, Command::Cancel(_)),
             cancellation: self.command_tasks.cancellation_token(),
         };
 

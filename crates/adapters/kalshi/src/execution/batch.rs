@@ -476,7 +476,7 @@ fn admit_cancellations(
     }
 
     for child in &prepared {
-        child.mark_dispatched(&mut state, None)?;
+        child.mark_dispatched(&mut state, None, true)?;
     }
 
     Ok(Some(prepared))

@@ -258,6 +258,15 @@ pub struct KalshiExecutionClientConfig {
     /// so one pass covers a burst of notices; zero starts the pass immediately.
     #[builder(default)]
     pub recovery_debounce_ms: u64,
+    /// Emits fills from the private fill stream and cancellations from the cancel reply, and
+    /// keeps commands admitted while a recovery pass is pending. Recovery then audits these
+    /// events instead of producing them.
+    #[builder(default)]
+    pub direct_order_events: bool,
+    /// Positive time in seconds for which recovery may fail to verify direct order events
+    /// before submissions stop.
+    #[builder(default = 30)]
+    pub direct_audit_timeout_secs: u64,
 }
 
 #[cfg(feature = "python")]
@@ -272,6 +281,8 @@ nautilus_core::impl_pyo3_config_getters!(KalshiExecutionClientConfig {
     admit_collateral_netting: bool,
     recovery_idle_interval_secs: u64,
     recovery_debounce_ms: u64,
+    direct_order_events: bool,
+    direct_audit_timeout_secs: u64,
 });
 
 impl Default for KalshiExecutionClientConfig {
@@ -363,6 +374,18 @@ impl KalshiExecutionClientConfig {
         {
             return Err(ConfigError::invalid_value(
                 "recovery_idle_interval_secs",
+                "exceeds the supported clock range",
+            ));
+        }
+
+        validate_positive("direct_audit_timeout_secs", self.direct_audit_timeout_secs)?;
+
+        if Instant::now()
+            .checked_add(Duration::from_secs(self.direct_audit_timeout_secs))
+            .is_none()
+        {
+            return Err(ConfigError::invalid_value(
+                "direct_audit_timeout_secs",
                 "exceeds the supported clock range",
             ));
         }
@@ -619,6 +642,8 @@ mod tests {
                 admit_collateral_netting: false,
                 recovery_idle_interval_secs: 1,
                 recovery_debounce_ms: 0,
+                direct_order_events: false,
+                direct_audit_timeout_secs: 30,
             }
         );
         assert!(!data.has_credentials());
@@ -722,6 +747,8 @@ mod tests {
             .admit_collateral_netting(true)
             .recovery_idle_interval_secs(5)
             .recovery_debounce_ms(150)
+            .direct_order_events(true)
+            .direct_audit_timeout_secs(45)
             .transport_backend(TransportBackend::Sockudo)
             .build();
         let round_trip_data: KalshiDataClientConfig =

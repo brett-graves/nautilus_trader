@@ -6914,6 +6914,412 @@ fn native_fill_for_order(peer: &Peer, id: &str, qty: &str, terminal: bool) -> De
     cash
 }
 
+async fn direct_peer(cash: &str) -> Peer {
+    let mut peer = Peer::with_timeout(None, 10).await;
+    peer.config.direct_order_events = true;
+    peer.config.recovery_idle_interval_secs = 30;
+    peer.config.recovery_debounce_ms = 100;
+    peer.balance.lock().unwrap()["balance_dollars"] = cash.into();
+    peer
+}
+
+/// Applies queued events until `done`, polling so that a condition no event announces is seen.
+async fn direct_wait(
+    output: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    done: impl Fn() -> bool,
+) -> Vec<OrderEventAny> {
+    let mut events = Vec::new();
+
+    loop {
+        while let Ok(event) = output.try_recv() {
+            if let ExecutionEvent::Order(order) = &event {
+                events.push(order.clone());
+            }
+
+            AsyncRunner::handle_exec_event(event);
+        }
+
+        if done() {
+            return events;
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn direct_connected(harness: &ExecutionHarness) -> bool {
+    harness
+        .exec_engine()
+        .borrow()
+        .get_client(&harness.client_id())
+        .unwrap()
+        .is_connected()
+}
+
+/// Withholds every balance reply, so no recovery pass can complete.
+fn direct_hold_recovery(peer: &Peer) {
+    peer.balance_gate
+        .forget_permits(peer.balance_gate.available_permits());
+}
+
+fn direct_release_recovery(peer: &Peer) {
+    peer.balance_gate
+        .add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+}
+
+/// Sends the private fill message which describes the venue fill the peer reports over REST.
+fn direct_fill_message(peer: &Peer, fee: &str) {
+    let fill = peer.fills.lock().unwrap()["fills"][0].clone();
+    let order = peer.orders.lock().unwrap()["orders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["order_id"] == fill["order_id"])
+        .unwrap()
+        .clone();
+    let created: jiff::Timestamp = fill["created_time"].as_str().unwrap().parse().unwrap();
+
+    *peer.notification.lock().unwrap() = Some(json!({
+        "type": "fill",
+        "sid": 0,
+        "msg": {
+            "trade_id": fill["fill_id"],
+            "order_id": fill["order_id"],
+            "client_order_id": order["client_order_id"],
+            "market_ticker": fill["market_ticker"],
+            "exchange_index": 3,
+            "subaccount": 0,
+            "is_taker": fill["is_taker"],
+            "yes_price_dollars": fill["yes_price_dollars"],
+            "count_fp": fill["count_fp"],
+            "fee_cost": fee,
+            "outcome_side": fill["outcome_side"],
+            "book_side": fill["book_side"],
+            "ts_ms": created.as_millisecond(),
+        }
+    }));
+    peer.notification_ready.notify_one();
+}
+
+fn direct_execute(harness: &ExecutionHarness, order: &OrderAny) {
+    let command = SubmitOrder::from_order(
+        order,
+        harness.trader_id(),
+        Some(harness.client_id()),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+    harness
+        .exec_engine()
+        .borrow()
+        .execute(TradingCommand::SubmitOrder(command));
+}
+
+#[tokio::test]
+async fn direct_accept_and_cancel_resolve_from_replies_before_any_recovery_pass() {
+    tokio::time::timeout(Duration::from_secs(25), async {
+        let peer = direct_peer("3.000100").await;
+        peer.submissions.ack_gate.add_permits(1);
+        peer.changes.ack_gate.add_permits(1);
+        let (harness, mut output, _data) = native_consumer(&peer).await;
+        direct_wait(&mut output, || direct_connected(&harness)).await;
+        direct_hold_recovery(&peer);
+
+        let order = native_order(&harness, "direct-cancel", OrderSide::Buy, true);
+        let id = order.client_order_id();
+        native_submit(&harness, &order, None);
+        let mut events = direct_wait(&mut output, || {
+            native_status(&harness, id) == OrderStatus::Accepted
+        })
+        .await;
+        assert_eq!(
+            native_balance(&harness).locked.as_decimal(),
+            dec("0.784500")
+        );
+
+        let cached = harness.cache().borrow().order(&id).unwrap().clone();
+        assert_eq!(
+            cached.venue_order_id(),
+            Some(VenueOrderId::from("native-1"))
+        );
+        native_cancel(&harness, &cached);
+        events.extend(
+            direct_wait(&mut output, || {
+                native_status(&harness, id) == OrderStatus::Canceled
+                    && native_balance(&harness).locked.as_decimal().is_zero()
+            })
+            .await,
+        );
+
+        // Both outcomes arrived while every balance read, and so every pass, was withheld
+        assert!(matches!(events[0], OrderEventAny::Submitted(_)));
+        assert!(matches!(events[1], OrderEventAny::Accepted(_)));
+        assert!(matches!(events.last().unwrap(), OrderEventAny::Canceled(_)));
+        assert_eq!(native_balance(&harness).free.as_decimal(), dec("3.000100"));
+        assert_eq!(peer.changes.writes.lock().unwrap().len(), 1);
+
+        // A second order is admitted at once, with the first cancellation still unverified
+        peer.submissions.ack_gate.add_permits(1);
+        let next = native_order(&harness, "direct-next", OrderSide::Buy, true);
+        direct_execute(&harness, &next);
+        direct_wait(&mut output, || {
+            native_status(&harness, next.client_order_id()) == OrderStatus::Accepted
+        })
+        .await;
+
+        // The withheld pass and any retry it needs finish within a few balance reads
+        direct_release_recovery(&peer);
+        let reads = peer.balance_reads.load(Ordering::SeqCst);
+        let mut audited = direct_wait(&mut output, || {
+            peer.balance_reads.load(Ordering::SeqCst) > reads
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
+        audited.extend(
+            direct_wait(&mut output, || {
+                direct_connected(&harness)
+                    && native_balance(&harness).locked.as_decimal() == dec("0.784500")
+            })
+            .await,
+        );
+
+        assert!(
+            audited.iter().all(|event| !matches!(
+                event,
+                OrderEventAny::Canceled(_) | OrderEventAny::Accepted(_)
+            )),
+            "recovery replayed direct events: {audited:?}"
+        );
+        assert_eq!(native_status(&harness, id), OrderStatus::Canceled);
+        assert_eq!(
+            native_status(&harness, next.client_order_id()),
+            OrderStatus::Accepted
+        );
+        native_disconnect(&harness).await;
+    })
+    .await
+    .unwrap();
+}
+
+#[rstest]
+#[case::agrees("0.000100", true)]
+#[case::disagrees("0.000200", false)]
+#[tokio::test]
+async fn direct_fill_emits_once_admits_the_next_order_and_recovery_audits_it(
+    #[case] fee: &str,
+    #[case] agrees: bool,
+) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let peer = direct_peer("3.000100").await;
+        peer.submissions.ack_gate.add_permits(1);
+        let (harness, mut output, _data) = native_consumer(&peer).await;
+        direct_wait(&mut output, || direct_connected(&harness)).await;
+
+        let order = native_order(&harness, "direct-fill", OrderSide::Buy, false);
+        let id = order.client_order_id();
+        native_submit(&harness, &order, None);
+        direct_wait(&mut output, || {
+            native_status(&harness, id) == OrderStatus::Accepted && direct_connected(&harness)
+        })
+        .await;
+
+        direct_hold_recovery(&peer);
+        native_fill(&peer, "1.25", true);
+        peer.balance.lock().unwrap()["balance_dollars"] = "2.250000".into();
+        direct_fill_message(&peer, fee);
+        let events = direct_wait(&mut output, || {
+            native_status(&harness, id) == OrderStatus::Filled
+        })
+        .await;
+
+        assert_eq!(events.len(), 1);
+        let OrderEventAny::Filled(filled) = &events[0] else {
+            panic!("expected Filled");
+        };
+        assert_eq!(filled.last_qty, Quantity::from("1.25"));
+        assert_eq!(filled.last_px, Price::from("0.600000"));
+        assert_eq!(filled.commission.unwrap().as_decimal(), dec(fee));
+        assert_eq!(filled.liquidity_side, LiquiditySide::Taker);
+        assert_eq!(filled.venue_order_id, VenueOrderId::from("native-1"));
+
+        // The fill is unverified and no pass can complete, yet the next order is not denied
+        peer.submissions.ack_gate.add_permits(1);
+        let next = native_order(&harness, "direct-after-fill", OrderSide::Sell, false);
+        direct_execute(&harness, &next);
+        direct_wait(&mut output, || {
+            native_status(&harness, next.client_order_id()) == OrderStatus::Accepted
+        })
+        .await;
+        assert_eq!(peer.submissions.writes.lock().unwrap().len(), 2);
+
+        direct_release_recovery(&peer);
+
+        if agrees {
+            let audited = direct_wait(&mut output, || {
+                native_balance(&harness).total.as_decimal() == dec("2.250000")
+                    && direct_connected(&harness)
+            })
+            .await;
+
+            assert!(
+                audited
+                    .iter()
+                    .all(|event| !matches!(event, OrderEventAny::Filled(_))),
+                "recovery replayed the direct fill: {audited:?}"
+            );
+            assert_eq!(native_status(&harness, id), OrderStatus::Filled);
+        } else {
+            direct_wait(&mut output, || !direct_connected(&harness)).await;
+            let reads = peer.balance_reads.load(Ordering::SeqCst);
+            direct_wait(&mut output, || {
+                peer.balance_reads.load(Ordering::SeqCst) >= reads + 4
+            })
+            .await;
+
+            // Later passes keep failing the same audit and never restore readiness
+            assert!(!direct_connected(&harness));
+
+            let denied = native_order(&harness, "direct-degraded", OrderSide::Buy, false);
+            direct_execute(&harness, &denied);
+            let cached = harness
+                .cache()
+                .borrow()
+                .order_owned(&denied.client_order_id())
+                .unwrap();
+            let OrderEventAny::Denied(event) = cached.last_event() else {
+                panic!("expected a denial while degraded");
+            };
+            assert_eq!(
+                event.reason.as_str(),
+                "SUBMIT_FAILED: Kalshi submission requires current-session readiness"
+            );
+            assert_eq!(peer.submissions.writes.lock().unwrap().len(), 2);
+
+            // A cancellation still reaches the venue from the degraded client
+            peer.changes.ack_gate.add_permits(1);
+            let resting = harness
+                .cache()
+                .borrow()
+                .order(&next.client_order_id())
+                .unwrap()
+                .clone();
+            native_cancel(&harness, &resting);
+            direct_wait(&mut output, || {
+                native_status(&harness, next.client_order_id()) == OrderStatus::Canceled
+            })
+            .await;
+        }
+
+        native_disconnect(&harness).await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn direct_cancel_of_a_filled_order_delivers_the_fill_once_and_no_cancellation() {
+    tokio::time::timeout(Duration::from_secs(25), async {
+        let peer = direct_peer("3.000100").await;
+        peer.submissions.ack_gate.add_permits(1);
+        peer.changes.ack_gate.add_permits(1);
+        let (harness, mut output, _data) = native_consumer(&peer).await;
+        direct_wait(&mut output, || direct_connected(&harness)).await;
+
+        let order = native_order(&harness, "direct-missing", OrderSide::Buy, false);
+        let id = order.client_order_id();
+        native_submit(&harness, &order, None);
+        direct_wait(&mut output, || {
+            native_status(&harness, id) == OrderStatus::Accepted && direct_connected(&harness)
+        })
+        .await;
+
+        native_fill(&peer, "1.25", true);
+        peer.balance.lock().unwrap()["balance_dollars"] = "2.250000".into();
+        *peer.changes.mode.lock().unwrap() = "not-found".into();
+        let cached = harness.cache().borrow().order(&id).unwrap().clone();
+        native_cancel(&harness, &cached);
+
+        let events = direct_wait(&mut output, || {
+            native_status(&harness, id) == OrderStatus::Filled
+                && native_balance(&harness).total.as_decimal() == dec("2.250000")
+                && direct_connected(&harness)
+        })
+        .await;
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, OrderEventAny::Canceled(_)))
+        );
+        native_disconnect(&harness).await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn direct_unknown_create_outcome_emits_nothing_until_recovery() {
+    tokio::time::timeout(Duration::from_secs(25), async {
+        let peer = direct_peer("3.000100").await;
+        peer.submissions.ack_gate.add_permits(1);
+        *peer.submissions.outcome.lock().unwrap() = "unknown".into();
+        let (harness, mut output, _data) = native_consumer(&peer).await;
+        direct_wait(&mut output, || direct_connected(&harness)).await;
+        direct_hold_recovery(&peer);
+
+        let order = native_order(&harness, "direct-unknown", OrderSide::Buy, false);
+        let id = order.client_order_id();
+        native_submit(&harness, &order, None);
+        direct_wait(&mut output, || {
+            native_status(&harness, id) == OrderStatus::Submitted
+        })
+        .await;
+        peer.submissions.written.notified().await;
+
+        // The 503 leaves the outcome unknown: no event, no resend, and no further admission
+        let quiet = tokio::time::timeout(Duration::from_millis(1_500), async {
+            direct_wait(&mut output, || {
+                native_status(&harness, id) != OrderStatus::Submitted
+            })
+            .await
+        })
+        .await;
+        assert!(quiet.is_err());
+        assert_eq!(peer.submissions.writes.lock().unwrap().len(), 1);
+        assert!(!direct_connected(&harness));
+
+        let fixtures: Value =
+            serde_json::from_str(include_str!("../../test_data/rest_responses.json")).unwrap();
+        let request = peer.submissions.writes.lock().unwrap()[0].clone();
+        SubmissionPeer::create(&request, &fixtures, &peer.orders, "resting", "native-1");
+        direct_release_recovery(&peer);
+
+        let events = direct_wait(&mut output, || {
+            native_status(&harness, id) == OrderStatus::Accepted && direct_connected(&harness)
+        })
+        .await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, OrderEventAny::Accepted(_)))
+                .count(),
+            1
+        );
+        assert_eq!(peer.submissions.writes.lock().unwrap().len(), 1);
+        native_disconnect(&harness).await;
+    })
+    .await
+    .unwrap();
+}
+
 #[rstest]
 #[case::buy_insufficient(OrderSide::Buy, "0.400000", "1.000100", false)]
 #[case::buy_exact(OrderSide::Buy, "0.400000", "1.105200", true)]

@@ -115,7 +115,7 @@ impl KalshiDataClientConfig {
 impl KalshiExecutionClientConfig {
     /// Configuration for the Kalshi execution client.
     #[new]
-    #[pyo3(signature = (account_id = None, api_key_id = None, private_key = None, environment = None, base_url_http = None, base_url_ws = None, proxy_url = None, http_timeout_secs = None, ws_timeout_secs = None, exchange_index = None, transport_backend = None, subaccount = None, admit_collateral_netting = None, recovery_idle_interval_secs = None, recovery_debounce_ms = None))]
+    #[pyo3(signature = (account_id = None, api_key_id = None, private_key = None, environment = None, base_url_http = None, base_url_ws = None, proxy_url = None, http_timeout_secs = None, ws_timeout_secs = None, exchange_index = None, transport_backend = None, subaccount = None, admit_collateral_netting = None, recovery_idle_interval_secs = None, recovery_debounce_ms = None, direct_order_events = None, direct_audit_timeout_secs = None))]
     #[expect(
         clippy::too_many_arguments,
         reason = "thin projection of the Rust config fields"
@@ -136,6 +136,8 @@ impl KalshiExecutionClientConfig {
         admit_collateral_netting: Option<bool>,
         recovery_idle_interval_secs: Option<u64>,
         recovery_debounce_ms: Option<u64>,
+        direct_order_events: Option<bool>,
+        direct_audit_timeout_secs: Option<u64>,
     ) -> PyResult<Self> {
         let defaults = Self::default();
 
@@ -157,6 +159,9 @@ impl KalshiExecutionClientConfig {
             recovery_idle_interval_secs: recovery_idle_interval_secs
                 .unwrap_or(defaults.recovery_idle_interval_secs),
             recovery_debounce_ms: recovery_debounce_ms.unwrap_or(defaults.recovery_debounce_ms),
+            direct_order_events: direct_order_events.unwrap_or(defaults.direct_order_events),
+            direct_audit_timeout_secs: direct_audit_timeout_secs
+                .unwrap_or(defaults.direct_audit_timeout_secs),
         };
 
         config.validate().map_err(config_error_to_pyvalue_err)?;
@@ -245,6 +250,8 @@ mod tests {
                 kwargs.set_item("subaccount", 7).unwrap();
                 kwargs.set_item("recovery_idle_interval_secs", 5).unwrap();
                 kwargs.set_item("recovery_debounce_ms", 150).unwrap();
+                kwargs.set_item("direct_order_events", true).unwrap();
+                kwargs.set_item("direct_audit_timeout_secs", 45).unwrap();
             }
 
             let config = class.call((), Some(&kwargs)).unwrap();
@@ -291,6 +298,8 @@ mod tests {
                     admit_collateral_netting: true,
                     recovery_idle_interval_secs: 5,
                     recovery_debounce_ms: 150,
+                    direct_order_events: true,
+                    direct_audit_timeout_secs: 45,
                 };
 
                 assert_eq!(actual, expected);

@@ -88,6 +88,10 @@ class KalshiExecutionClientConfig:
     def recovery_idle_interval_secs(self) -> int: ...
     @property
     def recovery_debounce_ms(self) -> int: ...
+    @property
+    def direct_order_events(self) -> bool: ...
+    @property
+    def direct_audit_timeout_secs(self) -> int: ...
     def __init__(
         self,
         account_id: model.AccountId | None = None,
@@ -105,6 +109,8 @@ class KalshiExecutionClientConfig:
         admit_collateral_netting: bool | None = None,
         recovery_idle_interval_secs: int | None = None,
         recovery_debounce_ms: int | None = None,
+        direct_order_events: bool | None = None,
+        direct_audit_timeout_secs: int | None = None,
     ) -> None: ...
     @property
     def has_credentials(self) -> bool: ...

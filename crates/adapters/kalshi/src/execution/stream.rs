@@ -42,7 +42,7 @@ use super::{
     KalshiExecutionSnapshot,
     account::ReservationId,
     collect_recovery_snapshot,
-    context::{OrderPlan, PrivateState, RecoveryContextError, Settlement},
+    context::{OrderPlan, PrivateState, RecoveryAuditError, RecoveryContextError, Settlement},
     load_definition, reports, timestamp,
 };
 use crate::{
@@ -69,6 +69,8 @@ pub(super) struct PrivateStream {
     pub(super) instruments: HashSet<InstrumentId>,
     pub(super) ready: Arc<AtomicBool>,
     pub(super) ws_client: KalshiWebSocketClient,
+    /// Set once recovery contradicts a direct order event; readiness never returns.
+    pub(super) degraded: bool,
 }
 
 impl PrivateStream {
@@ -84,7 +86,10 @@ impl PrivateStream {
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         let idle = Duration::from_secs(self.config.recovery_idle_interval_secs);
         let debounce = Duration::from_millis(self.config.recovery_debounce_ms);
+        let audit_timeout = Duration::from_secs(self.config.direct_audit_timeout_secs);
         let mut verified: Option<time::Instant> = None;
+        let mut failing: Option<time::Instant> = None;
+        let mut owed = false;
 
         loop {
             let recover = tokio::select! {
@@ -95,7 +100,9 @@ impl PrivateStream {
                     None => break,
                 },
                 request = requests.recv() => if request.is_some() { true } else { break },
-                _ = interval.tick() => self.ws_client.is_active() && self.poll_due(verified, idle),
+                _ = interval.tick() => {
+                    self.ws_client.is_active() && (owed || self.poll_due(verified, idle))
+                }
             };
 
             if !recover {
@@ -124,6 +131,8 @@ impl PrivateStream {
             match result {
                 Ok(()) => {
                     verified = Some(time::Instant::now());
+                    failing = None;
+                    owed = false;
 
                     if let Some(startup) = startup.take() {
                         let _ = startup.send(Ok(()));
@@ -131,6 +140,33 @@ impl PrivateStream {
                 }
                 Err(e) => {
                     let fatal = e.downcast_ref::<RecoveryContextError>().is_some();
+                    let contradicted = e.downcast_ref::<RecoveryAuditError>().is_some();
+                    let stale =
+                        failing.get_or_insert_with(time::Instant::now).elapsed() >= audit_timeout;
+
+                    // Direct order events keep commands admitted while a pass is retried
+                    if self.config.direct_order_events
+                        && self.ready.load(Ordering::Acquire)
+                        && !fatal
+                        && !contradicted
+                        && !stale
+                    {
+                        owed = true;
+                        log::warn!("Kalshi recovery has not yet verified direct order events: {e}");
+                        continue;
+                    }
+
+                    if contradicted {
+                        self.degraded = true;
+                        log::error!(
+                            "Kalshi recovery contradicts a direct order event; submissions stop until the client reconnects: {e}"
+                        );
+                    } else if self.config.direct_order_events && stale {
+                        log::error!(
+                            "Kalshi recovery could not verify direct order events in time; submissions stop until a pass completes: {e}"
+                        );
+                    }
+
                     self.ready.store(false, Ordering::Release);
                     self.state
                         .lock()
@@ -417,7 +453,8 @@ impl PrivateStream {
             log::debug!("Kalshi command admission remains blocked: {e}");
         }
 
-        self.ready.store(amendments.is_ok(), Ordering::Release);
+        self.ready
+            .store(amendments.is_ok() && !self.degraded, Ordering::Release);
         Ok(())
     }
 
@@ -484,6 +521,11 @@ impl PrivateStream {
             return false;
         }
 
+        if self.config.direct_order_events && self.ready.load(Ordering::Acquire) {
+            self.notice_direct(message);
+            return true;
+        }
+
         self.ready.store(false, Ordering::Release);
         let mut state = self
             .state
@@ -495,6 +537,29 @@ impl PrivateStream {
         }
 
         true
+    }
+
+    /// Records a notice for the audit pass and emits a fill it fully describes.
+    ///
+    /// Readiness and the account session stay unchanged, so commands are not fenced by the pass
+    /// which this notice starts.
+    fn notice_direct(&self, message: &KalshiWsMessage) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("private state lock is not poisoned");
+
+        if let Err(e) = state.record_notice(message) {
+            log::warn!("Kalshi private notification requires authoritative recovery: {e}");
+        }
+
+        if let KalshiWsMessage::Fill(data) = message {
+            match state.direct_fill(&data.msg, &self.emitter) {
+                Ok(true) => {}
+                Ok(false) => log::debug!("Kalshi private fill has no owned open order"),
+                Err(e) => log::warn!("Kalshi private fill awaits recovery: {e}"),
+            }
+        }
     }
 
     fn check_preparation(
@@ -1210,6 +1275,7 @@ mod tests {
             instruments: HashSet::new(),
             ready: Arc::clone(&ready),
             ws_client,
+            degraded: false,
         }
     }
 

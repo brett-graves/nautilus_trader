@@ -1079,6 +1079,69 @@ explains the rounding mechanics; it does not establish `fee_cost` semantics.
 - **Client lifetime**: Private terminal ownership and command identities remain for the execution
   client's lifetime. Purging the shared cache does not prune that state.
 
+### Direct order events
+
+By default every order event after acceptance comes from a completed private recovery pass, and a
+private notice removes readiness until that pass completes. On Basic and Advanced tiers a pass
+takes at least one second. `direct_order_events=true` changes the source of three outcomes and
+relaxes the readiness fence. Acceptance and definite rejection already come from the create reply
+in both modes.
+
+| Outcome                  | Source with `direct_order_events`                                                    |
+| ------------------------ | ------------------------------------------------------------------------------------ |
+| `OrderFilled`            | Private `fill` message which names an owned open order and carries every fill field. |
+| `OrderCanceled`          | Successful cancel reply with a positive `reduced_by`.                                |
+| Readiness after a notice | Unchanged: a private notice starts a pass but does not remove readiness.             |
+
+- **Fill fields**: The message must carry `trade_id`, `order_id`, `market_ticker`, `book_side`,
+  `outcome_side`, `count_fp`, `yes_price_dollars`, `fee_cost`, `is_taker`, and `ts_ms`. Otherwise
+  recovery produces the fill. A fill for a submitted order without a venue ID emits `OrderAccepted`
+  first.
+- **Cancel order**: `reduced_by` implies the quantity filled before the cancellation. The client
+  emits `OrderCanceled` once it has emitted those fills, so a fill never follows the cancellation
+  of its order. A reply which reduced nothing, an error, or `404` leaves the order to recovery.
+- **Cancellations skip readiness**: A cancellation of an order with a venue ID is sent on the
+  connection it was issued on, without waiting for recovery, including while the client is unready.
+- **Submissions**: A submission needs a connected private stream which recovery has verified at
+  least once, no unknown create or change outcome since, and no audit failure. It does not wait for
+  the pass a notice started. Reduce-only orders and order lists keep the default fence and wait
+  until recovery has verified every direct event.
+- **Other outcomes**: Venue expiry, the cancelled remainder of an IOC order, amendments, external
+  orders, and settlement still come from recovery.
+
+#### What recovery still does
+
+Each pass still collects the same REST evidence and applies the same exact cash check. It accounts
+for a direct fill by trade ID without emitting it again, and it only then changes `total` and the
+account net. Until then the filled order keeps its reservation, so `free` never exceeds what the
+default mode would report. An unfilled order cancelled directly releases its reservation at once.
+
+#### What direct order events give up
+
+- **Unconfirmed events**: An emitted fill or cancellation has not yet been matched to a REST record.
+  The default mode never emits such an event.
+- **Fee source**: A direct fill takes its commission from the stream `fee_cost`. Recovery compares
+  it with the REST fill and treats a difference as a contradiction.
+- **Stale balances**: `total` and position reports lag direct fills by one pass.
+- **Starved passes**: A submission or cancellation voids the pass in flight. Continuous order flow
+  can therefore delay verification until `direct_audit_timeout_secs`.
+
+#### Audit failures
+
+- **Contradiction**: If a REST fill differs from the fill emitted for the same trade ID, or the venue
+  order contradicts a direct cancellation, the client logs an error with
+  `KALSHI_DIRECT_FILL_MISMATCH` or `KALSHI_DIRECT_CANCEL_MISMATCH` and stays unready until it
+  reconnects. It does not correct the emitted event.
+- **Timeout**: If passes fail for `direct_audit_timeout_secs`, the client logs an error and stays
+  unready until a pass completes.
+- **While unready**: Submissions are denied. Cancellations of orders with a venue ID still reach the
+  venue.
+
+:::warning
+Use `direct_order_events` only on a dedicated subaccount whose orders all come from this client.
+Verify the first fills of a session against the venue before relying on it.
+:::
+
 ### Order and fill reports
 
 - **Targeted reports**: Order reports require cached order context.
@@ -1291,6 +1354,10 @@ The execution client also accepts:
   client is ready. An unready client retries every second.
 - `recovery_debounce_ms` (default `0`, at most `1000`): Delay between the first private notice and
   the recovery pass it starts.
+- `direct_order_events` (default `False`): Emit fills and cancellations before recovery confirms
+  them. See [Direct order events](#direct-order-events).
+- `direct_audit_timeout_secs` (default `30`): Seconds for which recovery may fail to verify direct
+  order events before submissions stop.
 
 ### Shared validation
 

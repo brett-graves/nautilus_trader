@@ -61,6 +61,8 @@ pub(super) struct Submission {
     pub(super) ws_client: KalshiWebSocketClient,
     pub(super) refresh: tokio::sync::mpsc::UnboundedSender<()>,
     pub(super) session: String,
+    /// Whether admission and dispatch require the account session captured with the command.
+    pub(super) fenced: bool,
     pub(super) cancellation: CancellationToken,
 }
 
@@ -93,6 +95,7 @@ impl Submission {
             &self.ws_client,
             &self.cancellation,
             &self.session,
+            self.fenced,
         );
         let result = self.http.create_order(&self.request).await;
 
@@ -102,7 +105,7 @@ impl Submission {
     pub(super) fn admit(&mut self, state: &mut PrivateState, hold: Decimal) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.ready.load(Ordering::Acquire)
-                && state.session == self.session
+                && (!self.fenced || state.session == self.session)
                 && state.epoch.is_some()
                 && state.epoch == self.ws_client.connection_epoch()
                 && !state
@@ -111,6 +114,10 @@ impl Submission {
                     .expect("settlement barrier lock")
                     .is_blocked(),
             "Kalshi submission requires current-session readiness"
+        );
+        anyhow::ensure!(
+            !self.order.is_reduce_only() || !state.has_unverified_events(),
+            "Kalshi reduce-only requires verified execution state"
         );
         expiry(
             &self.order,
@@ -244,12 +251,20 @@ pub(super) fn transport(
     ws_client: &KalshiWebSocketClient,
     cancellation: &CancellationToken,
     session: &str,
+    fenced: bool,
 ) -> KalshiHttpClient {
     let state = Arc::clone(state);
-    let epoch = state
-        .lock()
-        .expect("private state lock is not poisoned")
-        .epoch;
+
+    // An unfenced write needs the connection it was admitted on, not a recovered account
+    let epoch = if fenced {
+        state
+            .lock()
+            .expect("private state lock is not poisoned")
+            .epoch
+    } else {
+        ws_client.connection_epoch()
+    };
+
     let ws_client = ws_client.clone();
     let cancellation = cancellation.clone();
     let session = session.to_owned();
@@ -257,9 +272,8 @@ pub(super) fn transport(
         .with_dispatch_check(cancellation.clone(), move || {
             let state = state.lock().expect("private state lock is not poisoned");
             !cancellation.is_cancelled()
-                && state.session == session
+                && (!fenced || state.session == session && state.epoch == epoch)
                 && epoch.is_some()
-                && state.epoch == epoch
                 && ws_client.connection_epoch() == epoch
                 && !state
                     .barrier
@@ -648,6 +662,7 @@ pub(super) mod tests {
                 ws_client,
                 refresh,
                 session,
+                fenced: true,
                 cancellation: CancellationToken::new(),
             },
             output,
