@@ -148,12 +148,48 @@ The instrument provider accepts only markets with:
 - `settlement_bounds_type=default`.
 - USD 1 contract notional.
 - No multivariate collection or selected legs.
-- The documented empty `collateral_return_type`, indicating no collateral-return netting.
+- The documented empty `collateral_return_type`, indicating no collateral-return netting, unless
+  the client sets `admit_collateral_netting`.
+
+#### Collateral-return netting events
+
+Kalshi returns collateral early on hedged positions in an event whose `collateral_return_type` is
+`MECNET` or `DIRECNET`, but only for a subaccount with netting enabled. Kalshi fixes that choice
+for an event at the subaccount's first order in it. See
+[Get Event](https://docs.kalshi.com/api-reference/events/get-event) and
+[Get Positions](https://docs.kalshi.com/api-reference/portfolio/get-positions).
+
+Both clients refuse these events by default. `admit_collateral_netting=true` admits them:
+
+- **Instruments**: Each market still maps to one YES-priced `BinaryOption` with the same contract
+  terms. `info["event"]["collateral_return_type"]` retains the netting type.
+- **Data client**: Market data needs no further condition. The setting is independent on each
+  client, so a data client can admit events which an execution client on the same node refuses.
+- **Execution client**: The adapter never models returned collateral. It trades and accounts for
+  these events only while Kalshi reports that netting does not apply to the configured subaccount
+  and shard, so the [balance model](#balance-model) holds unchanged.
+- **Pre-trade evidence**: Before reserving funds for an order or amendment, the client requires
+  every position record in the event to report `netting_enabled=false`, and the subaccount's
+  netting setting to be disabled on the shard. Missing or ambiguous evidence denies the order. Each
+  check costs one positions read and one netting-settings read.
+- **Position evidence**: A nonzero position in a netting event must report `netting_enabled=false`.
+  Otherwise reports fail and private recovery stays incomplete, which keeps the client unready.
+- **Unfilled first orders**: An earlier order which never filled leaves no position record. If it
+  fixed netting on for the event, the client detects this only when a later fill reports
+  `netting_enabled=true`, and then stays unready with the position open. Trade these events only
+  from a subaccount whose netting setting has always been disabled.
+
+:::warning
+Do not enable collateral-return netting on a subaccount while an execution client with
+`admit_collateral_netting=true` trades it. The client does not change the venue setting and cannot
+reconcile cash after Kalshi returns collateral.
+:::
 
 #### Rejection rules and unsupported operations
 
-- **Rejected economics**: The provider rejects unknown product or collateral behavior, `MECNET`,
-  `DIRECNET`, scalar payouts, and nonzero settlement floors.
+- **Rejected economics**: The provider rejects unknown product or collateral behavior, scalar
+  payouts, and nonzero settlement floors. It rejects `MECNET` and `DIRECNET` unless
+  `admit_collateral_netting` is set.
 - **Netting test**: `mutually_exclusive=false` does not prove that an event has no netting.
 - **Refusal reasons**: A refused bootstrap market fails the data connection, and the adapter logs
   the ticker with the first failed rule. Instrument discovery skips refused markets and logs them at
@@ -673,6 +709,8 @@ Before dispatch, the adapter checks:
 - **Fee metadata**: `quadratic` or `quadratic_with_maker_fees` with a nonnegative multiplier. Event
   overrides must supply both the fee type and multiplier.
 - **Cash**: Sufficient free cash, including principal and the conservative fee allowance.
+- **Netting**: For a `MECNET` or `DIRECNET` event, venue evidence that netting does not apply to the
+  subaccount. See [Collateral-return netting events](#collateral-return-netting-events).
 
 #### Admission and readiness
 
@@ -1219,6 +1257,7 @@ cached orders. Keep clients active until their positions settle.
 | `book_snapshot_timeout_secs`       | `10`         | Initial and recovery snapshot deadline; `0` disables deadlines.                  |
 | `update_instruments_interval_mins` | `60`         | Delay between completed instrument refreshes.                                    |
 | `transport_backend`                | `Sockudo`    | Required WebSocket backend; `Tungstenite` is rejected.                           |
+| `admit_collateral_netting`         | `False`      | Admit `MECNET` and `DIRECNET` event markets.                                     |
 
 ### Execution client configuration options
 
@@ -1236,6 +1275,10 @@ cached orders. Keep clients active until their positions settle.
 | `http_timeout_secs` | `60`         | REST attempt timeout in seconds.                                                            |
 | `ws_timeout_secs`   | `30`         | WebSocket connection, subscription-restoration, bootstrap, and account-observation timeout. |
 | `transport_backend` | `Sockudo`    | Required WebSocket backend; `Tungstenite` is rejected.                                      |
+
+The execution client also accepts `admit_collateral_netting` (default `False`). It admits `MECNET`
+and `DIRECNET` event markets only while Kalshi reports netting disabled for the subaccount. See
+[Collateral-return netting events](#collateral-return-netting-events).
 
 ### Shared validation
 
